@@ -1,28 +1,33 @@
 /*
  * cefrepair.c
  *
- *  ICNストリーミング配信における「修復アプリ」。
+ *  ICNストリーミング配信における「修復アプリ」
  *
- *  ■このアプリの役割（一言でいうと）
- *      届いた映像チャンクの番号を見張り、飛んでいる番号があったら、
- *      その番号だけを名指しで取り寄せる「番号の見張り番」。
- *      映像データ本体は保存も再生もしない。
+ *  ■このアプリの役割
+ *      届いた映像チャンクの番号を見張り，飛んでいる番号があれば
+ *      その番号だけを名指しで取り寄せる「番号の見張り番」
+ *      映像データ本体は保存も再生もしない
  *
  *  ■置き場所と動かし方
- *      icn-router のサーバ上で動かす（同じマシンの cefnetd に接続する）。
+ *      icn-router のサーバ上で動かす（同じマシンの cefnetd に接続する）
  *      例:  cefrepair ccnx:/video/stream1
  *
  *  ■動作の流れ（詳しくは cefrepair-dataflow.md のセクション4を参照）
  *      1. Symbolic Interest を送ってストリーミングコンテンツを要求する
  *      2. 届いたチャンクの番号を見て、飛び（欠損）を検出する
  *      3. 欠損した番号だけを Regular Interest で producer に取り寄せる
- *      4. 取り寄せた Data は cefnetd が自動で localcache に保存し、
+ *      4. 取り寄せた Data は cefnetd が自動で localcache に保存し，
  *         consumer にも転送してくれる（このアプリは何もしなくてよい）
  *
- *  ※このファイルは tools/cefgetstream/cefgetstream.c を雛形として作成した。
+ *  ■責務の分離（このファイルが受け持つのは ④cefore I/O と ⑤配線 だけ）
+ *      ① 欠損リスト管理   → repair_table.c / .h
+ *      ② 欠損検出ロジック → loss_detect.c / .h
+ *      ③ 修復スケジューラ → repair_sched.c / .h
+ *      上の①②③は cefore に依存しない純粋ロジックなので単体テストできる．
+ *      このファイルは，それらを cefnetd との送受信につなぎ込む役を担う．
+ *
+ *  ※このファイルは tools/cefgetstream/cefgetstream.c を雛形として作成．
  */
-
-#define __CEF_REPAIR_SOURECE__
 
 /****************************************************************************************
  Include Files（このアプリが使う外部の機能をまとめて読み込む）
@@ -42,6 +47,11 @@
 #include <cefore/cef_client.h>   /* cefnetd と通信するための関数（接続・送受信） */
 #include <cefore/cef_log.h>      /* ログ出力                                   */
 
+/* このアプリの純粋ロジック（cefore非依存）を分離したモジュール群 */
+#include "repair_table.h"        /* ① 欠損リスト（メモ②）の管理               */
+#include "loss_detect.h"         /* ② 番号の見張り＝欠損検出（メモ①）          */
+#include "repair_sched.h"        /* ③ 修復スケジューラ（場面B/C/D）            */
+
 /****************************************************************************************
  Macros（このアプリの中で使う「設定値」に名前を付けておく）
  ****************************************************************************************/
@@ -52,37 +62,8 @@
 /* 使い方（ヘルプ）を表示するための合言葉 */
 #define USAGE					print_usage(stderr)
 
-/*--- 修復の動作を決める設定値（実験に合わせて調整する） -----------------------------*/
-
-/* 欠損リスト（メモ②）の最大行数。これ以上の欠損は同時に管理できない。       */
-#define CefC_Repair_Table_Size		4096
-
-/* Regular Interest を送ってから「返事が来ない」と判断するまでの待ち時間。    */
-/* 単位はマイクロ秒。100000マイクロ秒 = 100ミリ秒。                          */
-#define CefC_Repair_Timeout_us		100000
-
-/* 1つの欠損チャンクを最大何回まで注文し直すか（無限ループ防止）。           */
-#define CefC_Repair_Max_Retry		3
-
-/* 「これより古い番号はもう諦める」境界の余裕（チャンク数）。               */
-/* 最新番号からこの数だけ過去までは取り寄せを試みる。cefnetd.conf の        */
-/* SYMBOLIC_BACKBUFFER（既定100）より少し小さい値にしておくのが安全。       */
-#define CefC_Repair_GiveUp_Margin	80
-
-/****************************************************************************************
- Structures Declaration（自分で作るデータの「形」を定義する）
- ****************************************************************************************/
-
-/*
- * 欠損リスト（メモ②）の1行ぶんを表す箱。
- * 「どの番号が」「いつ注文されて」「何回注文したか」を覚えておく。
- */
-typedef struct {
-	int			used;			/* この行が使用中か（1=使用中, 0=空き）         */
-	uint32_t	chunk_num;		/* 欠損しているチャンク番号                    */
-	uint64_t	last_req_time;	/* 最後に Regular Interest を送った時刻(us)     */
-	int			retry_count;	/* これまでに注文した回数                      */
-} CefT_Repair_Entry;
+/* 修復の動作を決める設定値（CefC_Repair_Table_Size は repair_table.h、
+   タイムアウト/再送回数/諦め境界は repair_sched.h で定義している）。 */
 
 /****************************************************************************************
  State Variables（アプリ全体で共有する状態。プログラムが動いている間ずっと保持する）
@@ -94,26 +75,11 @@ static int app_running_f = 0;
 /* cefnetd との接続を表す「取っ手」。送受信のたびにこれを使う。              */
 static CefT_Client_Handle fhdl;
 
-/* 欠損リスト（メモ②）本体。CefT_Repair_Table_Size 行ぶんの配列。           */
-static CefT_Repair_Entry repair_table[CefC_Repair_Table_Size];
-
-/*--- 統計（最後に成果を表示するための数え上げ） -------------------------------------*/
-static uint64_t stat_recv_chunks   = 0;	/* 受信したチャンク数               */
-static uint64_t stat_loss_detected = 0;	/* 欠損として検出した数             */
-static uint64_t stat_repaired      = 0;	/* 修復に成功した（届いた）数       */
-static uint64_t stat_regular_sent  = 0;	/* 送った Regular Interest の総数   */
-static uint64_t stat_gaveup        = 0;	/* 諦めた数                         */
-
 /****************************************************************************************
  Static Function Declaration（このファイルの中だけで使う関数の予告）
  ****************************************************************************************/
 static void print_usage (FILE* ofp);
 static void sigcatch (int sig);
-
-/* 欠損リスト（メモ②）を操作するための小さな関数たち */
-static void repair_table_add    (uint32_t chunk_num);	/* 1件追加               */
-static void repair_table_remove (uint32_t chunk_num);	/* 1件削除（修復成功時） */
-static int  repair_table_find   (uint32_t chunk_num);	/* 何行目にあるか探す     */
 
 /****************************************************************************************
  Main（プログラムはここから始まる）
@@ -148,9 +114,11 @@ int main (
 	uint64_t		sym_resend_time;			/* 次にSymbolic Interestを送り直す時刻 */
 	uint64_t		sym_resend_interval;		/* Symbolic Interestを送り直す間隔   */
 
-	/* 番号の見張りに使う変数（メモ①にあたる） */
-	int			first_received_f = 0;			/* 最初のチャンクを受信済みか        */
-	uint32_t	max_seq_seen = 0;				/* これまでに見た最大のチャンク番号  */
+	/* 分離したロジックモジュールが持つ状態（このファイルは配線するだけ） */
+	CefT_Repair_Table		repair_table;		/* ① 欠損リスト本体                 */
+	CefT_Loss_Detector		detector;			/* ② 番号の見張り状態（メモ①）      */
+	CefT_Repair_Stats		stats;				/* 統計（各モジュールが加算する）    */
+	CefT_Repair_SendList	send_list;			/* ③ が「送れ」と返してくる番号一覧  */
 
 	/***** 入力チェック用の旗 *****/
 	int uri_f = 0;
@@ -159,7 +127,9 @@ int main (
 	memset (&opt,        0, sizeof (CefT_CcnMsg_OptHdr));
 	memset (&params_sym, 0, sizeof (CefT_CcnMsg_MsgBdy));
 	memset (&params_reg, 0, sizeof (CefT_CcnMsg_MsgBdy));
-	memset (repair_table, 0, sizeof (repair_table));
+	memset (&stats,      0, sizeof (stats));
+	repair_table_init (&repair_table);
+	loss_detect_init  (&detector);
 	uri[0] = 0;
 
 	printf ("[cefrepair] Start\n");
@@ -323,6 +293,8 @@ int main (
 	/*===========================================================================
 		手順5: メインループ
 		  ここを延々と繰り返す。設計書セクション4-4の「ぐるぐる回る」部分。
+		  受信パース(④)とInterest送信(④)はここに残し、番号の判断(②③)は
+		  分離したモジュールに任せる。
 	===========================================================================*/
 	while (app_running_f) {
 
@@ -337,6 +309,8 @@ int main (
 
 		/*-------------------------------------------------------------------
 			【場面A】 cefnetd からチャンクを受け取り、番号をチェックする
+			          （受信・パースは cefore I/O なのでここに残す。
+			           番号の判断そのものは loss_detect に任せる。）
 		-------------------------------------------------------------------*/
 		res = cef_client_read (fhdl, &buff[index], CefC_AppBuff_Size - index);
 
@@ -363,47 +337,16 @@ int main (
 				/* ここまで来たら、1個の映像チャンクを受信できたということ。
 				   映像本体（app_frame.payload）は保存せず捨てる。
 				   使うのは「チャンク番号(app_frame.chunk_num)」だけ。 */
-				stat_recv_chunks++;
+				stats.recv_chunks++;
 
 				/* チャンク番号を持たないデータは番号の見張りができないので飛ばす */
 				if (!app_frame.chunk_num_f) {
 					continue;
 				}
 
-				uint32_t seq = app_frame.chunk_num;
-
-				/* --- A-1: いちばん最初に受け取ったチャンクの場合 --- */
-				if (!first_received_f) {
-					/* ストリームの途中からストリーミングコンテンツ要求を始めたので、これより前の
-					   番号は「欠損」ではない。ここを起点にするだけ。 */
-					first_received_f = 1;
-					max_seq_seen = seq;
-					continue;
-				}
-
-				/* --- A-2: 欠損リストに載っていた番号が今届いた場合 --- */
-				/*         → 修復成功。リストから消す。                  */
-				if (repair_table_find (seq) >= 0) {
-					repair_table_remove (seq);
-					stat_repaired++;
-					printf ("[cefrepair] Repaired chunk=%u\n", seq);
-				}
-
-				/* --- A-3: 番号が飛んでいた場合（欠損の検出） --- */
-				/*         例: これまで最大5なのに、8が来た → 6,7が欠損  */
-				if (seq > max_seq_seen + 1) {
-					uint32_t k;
-					for (k = max_seq_seen + 1 ; k < seq ; k++) {
-						repair_table_add (k);
-						stat_loss_detected++;
-						printf ("[cefrepair] Detected loss chunk=%u\n", k);
-					}
-				}
-
-				/* --- A-4: これまでの最大番号を更新する（メモ①） --- */
-				if (seq > max_seq_seen) {
-					max_seq_seen = seq;
-				}
+				/* ②へ委譲: 修復成功の消し込み・欠損の検出・最大番号の更新 */
+				loss_detect_on_chunk (
+					&detector, &repair_table, app_frame.chunk_num, &stats);
 
 			} while (res > 0);
 
@@ -412,66 +355,17 @@ int main (
 		}
 
 		/*-------------------------------------------------------------------
-			【場面B/C】 欠損リストを見て、Regular Interest を送る／送り直す
-			  ・まだ注文していない行 → 初めての注文（場面B）
-			  ・注文済みだが返事が遅い行 → 注文し直す（場面C）
-			  ・諦め判定（場面D）も同じループの中で行う
+			【場面B/C/D】 欠損リストを見て、Regular Interest を送る／送り直す
+			  どの番号を送るべきかの判断は ③(repair_sched) に任せ、
+			  ここは返ってきた番号を実際に cefnetd へ送る役だけを担う。
 		-------------------------------------------------------------------*/
-		for (i = 0 ; i < CefC_Repair_Table_Size ; i++) {
+		repair_sched_run (
+			&repair_table, detector.max_seq_seen, now_time, &stats, &send_list);
 
-			/* 空き行は飛ばす */
-			if (!repair_table[i].used) {
-				continue;
-			}
-
-			/* 【場面D】 古すぎる番号はもう間に合わないので諦める。
-			   最新番号から CefC_Repair_GiveUp_Margin より過去なら削除。 */
-			if (max_seq_seen > CefC_Repair_GiveUp_Margin &&
-				repair_table[i].chunk_num < max_seq_seen - CefC_Repair_GiveUp_Margin) {
-				printf ("[cefrepair] Give up chunk=%u (too old)\n",
-						repair_table[i].chunk_num);
-				repair_table[i].used = 0;
-				stat_gaveup++;
-				continue;
-			}
-
-			/* 【場面B】 まだ一度も注文していない行（retry_count==0） */
-			if (repair_table[i].retry_count == 0) {
-				/* この行の番号を、修復用Interestの箱にセットして送る */
-				params_reg.chunk_num = repair_table[i].chunk_num;
-				opt.lifetime = CefC_Default_LifetimeSec * 1000; /* 修復は通常寿命 */
-				cef_client_interest_input (fhdl, &opt, &params_reg);
-
-				/* 「注文した時刻」と「1回目」を記録する */
-				repair_table[i].last_req_time = now_time;
-				repair_table[i].retry_count   = 1;
-				stat_regular_sent++;
-				printf ("[cefrepair] Request(1st) chunk=%u\n", repair_table[i].chunk_num);
-				continue;
-			}
-
-			/* 【場面C】 注文済みだが、待ち時間を過ぎても返事が来ない行 */
-			if (now_time - repair_table[i].last_req_time > CefC_Repair_Timeout_us) {
-
-				if (repair_table[i].retry_count >= CefC_Repair_Max_Retry) {
-					/* 上限まで注文したのに届かない → 諦めて削除 */
-					printf ("[cefrepair] Give up chunk=%u (max retry)\n",
-							repair_table[i].chunk_num);
-					repair_table[i].used = 0;
-					stat_gaveup++;
-				} else {
-					/* もう一度注文し直し、回数を1つ増やす */
-					params_reg.chunk_num = repair_table[i].chunk_num;
-					opt.lifetime = CefC_Default_LifetimeSec * 1000;
-					cef_client_interest_input (fhdl, &opt, &params_reg);
-
-					repair_table[i].last_req_time = now_time;
-					repair_table[i].retry_count++;
-					stat_regular_sent++;
-					printf ("[cefrepair] Request(retry %d) chunk=%u\n",
-							repair_table[i].retry_count, repair_table[i].chunk_num);
-				}
-			}
+		for (i = 0 ; i < send_list.count ; i++) {
+			params_reg.chunk_num = send_list.chunks[i];
+			opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
+			cef_client_interest_input (fhdl, &opt, &params_reg);
 		}
 
 		/*-------------------------------------------------------------------
@@ -498,79 +392,14 @@ int main (
 	free (buff);
 
 	printf ("[cefrepair] ===== Statistics =====\n");
-	printf ("[cefrepair] Received chunks    = "FMTU64"\n", stat_recv_chunks);
-	printf ("[cefrepair] Losses detected    = "FMTU64"\n", stat_loss_detected);
-	printf ("[cefrepair] Repaired (arrived) = "FMTU64"\n", stat_repaired);
-	printf ("[cefrepair] Regular Interests  = "FMTU64"\n", stat_regular_sent);
-	printf ("[cefrepair] Gave up            = "FMTU64"\n", stat_gaveup);
+	printf ("[cefrepair] Received chunks    = "FMTU64"\n", stats.recv_chunks);
+	printf ("[cefrepair] Losses detected    = "FMTU64"\n", stats.loss_detected);
+	printf ("[cefrepair] Repaired (arrived) = "FMTU64"\n", stats.repaired);
+	printf ("[cefrepair] Regular Interests  = "FMTU64"\n", stats.regular_sent);
+	printf ("[cefrepair] Gave up            = "FMTU64"\n", stats.gaveup);
 	printf ("[cefrepair] Terminate\n");
 
 	exit (0);
-}
-
-/****************************************************************************************
- 欠損リスト（メモ②）を操作する関数たち
- ****************************************************************************************/
-
-/*
- * 欠損リストに番号を1件追加する。
- *   すでに同じ番号があれば二重登録はしない。
- *   空き行がなければ（リストが満杯なら）警告だけ出して諦める。
- */
-static void
-repair_table_add (
-	uint32_t chunk_num
-) {
-	int i;
-
-	/* すでに登録済みなら何もしない */
-	if (repair_table_find (chunk_num) >= 0) {
-		return;
-	}
-
-	/* 空いている行を探して、そこに書き込む */
-	for (i = 0 ; i < CefC_Repair_Table_Size ; i++) {
-		if (!repair_table[i].used) {
-			repair_table[i].used          = 1;
-			repair_table[i].chunk_num     = chunk_num;
-			repair_table[i].last_req_time = 0;
-			repair_table[i].retry_count   = 0;	/* まだ注文していない印 */
-			return;
-		}
-	}
-
-	/* ここに来たら満杯。実験では表サイズを増やすかタイムアウトを短くする。 */
-	printerr("repair table is full (chunk=%u dropped)\n", chunk_num);
-}
-
-/*
- * 欠損リストから指定番号の行を削除する（修復成功時に呼ぶ）。
- */
-static void
-repair_table_remove (
-	uint32_t chunk_num
-) {
-	int idx = repair_table_find (chunk_num);
-	if (idx >= 0) {
-		repair_table[idx].used = 0;	/* 使用中の旗を下ろせば「空き」になる */
-	}
-}
-
-/*
- * 欠損リストの中から指定番号を探す。
- *   見つかれば「何行目か(0以上)」を、なければ -1 を返す。
- */
-static int
-repair_table_find (
-	uint32_t chunk_num
-) {
-	int i;
-	for (i = 0 ; i < CefC_Repair_Table_Size ; i++) {
-		if (repair_table[i].used && repair_table[i].chunk_num == chunk_num) {
-			return (i);
-		}
-	}
-	return (-1);
 }
 
 /****************************************************************************************

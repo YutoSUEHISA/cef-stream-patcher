@@ -40,7 +40,7 @@ endif #OPENSSL_STATIC
 cefrepair_LDADD += -lpthread -ldl
 
 cefrepair_CFLAGS=$(AM_CPPFLAGS)
-cefrepair_SOURCES=cefrepair.c
+cefrepair_SOURCES=cefrepair.c repair_table.c loss_detect.c repair_sched.c
 
 # check debug build
 if CEFDBG_ENABLE
