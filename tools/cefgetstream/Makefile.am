@@ -40,7 +40,7 @@ endif #OPENSSL_STATIC
 cefgetstream_LDADD += -lpthread -ldl
 
 cefgetstream_CFLAGS=$(AM_CPPFLAGS)
-cefgetstream_SOURCES=cefgetstream.c
+cefgetstream_SOURCES=cefgetstream.c repair_table.c loss_detect.c repair_sched.c
 
 # check debug build
 if CEFDBG_ENABLE

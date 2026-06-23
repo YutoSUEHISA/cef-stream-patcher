@@ -49,6 +49,12 @@
 #include <cefore/cef_valid.h>
 #include <cefore/cef_log.h>
 
+/* 欠損検知＋再要求の頭脳ロジック（cefore非依存。cefrepair と同じ実装を共有）。
+   Symbolic モード受信時のラストホップ欠損を検出し Regular Interest で再要求する。 */
+#include "repair_table.h"		/* 欠損リスト（メモ②）の管理       */
+#include "loss_detect.h"		/* 番号の見張り＝欠損検出（メモ①）  */
+#include "repair_sched.h"		/* 修復スケジューラ（場面B/C/D）    */
+
 /****************************************************************************************
  Macros
  ****************************************************************************************/
@@ -140,8 +146,15 @@ int main (
 	Ceft_RxWnd* 	rxwnd_prev;
 	Ceft_RxWnd* 	rxwnd_head;
 	Ceft_RxWnd* 	rxwnd_tail;
-	
+
 	int backup_fd;
+
+	/* 修復用 Regular Interest と、欠損検知＋再要求の状態（Symbolicモードでのみ使う） */
+	CefT_CcnMsg_MsgBdy		params_reg;		/* 再要求する特定チャンク用 Interest */
+	CefT_Repair_Table		repair_table;	/* 欠損リスト本体（メモ②）          */
+	CefT_Loss_Detector		detector;		/* 番号の見張り状態（メモ①）        */
+	CefT_Repair_Stats		repair_stats;	/* 修復の統計                       */
+	CefT_Repair_SendList	send_list;		/* 「今送るべき番号」の一覧         */
 	
 	/***** flags 		*****/
 	int pipeline_f 		= 0;
@@ -162,7 +175,11 @@ int main (
 	
 	memset (&opt, 0, sizeof (CefT_CcnMsg_OptHdr));
 	memset (&params, 0, sizeof (CefT_CcnMsg_MsgBdy));
-	
+	memset (&params_reg, 0, sizeof (CefT_CcnMsg_MsgBdy));
+	memset (&repair_stats, 0, sizeof (repair_stats));
+	repair_table_init (&repair_table);
+	loss_detect_init  (&detector);
+
 	
 	/*---------------------------------------------------------------------------
 		Obtains parameters
@@ -428,6 +445,18 @@ int main (
 	if (nsg_flag) {
 		Cef_Int_Symbolic(params);
 		opt.lifetime 		= sg_lifetime * 1000;	//0.8.3
+
+		/* 修復用 Regular Interest を準備する。Symbolic と同じ名前を使い、
+		   chunk_num_f=1 で「特定チャンク番号を指定する」と宣言しておく。
+		   実際の番号は欠損が見つかるたびに params_reg.chunk_num を書き換える。 */
+		memcpy (params_reg.name, params.name, params.name_len);
+		params_reg.name_len    = params.name_len;
+		Cef_Int_Regular (params_reg);
+		params_reg.hoplimit    = 32;
+		params_reg.chunk_num_f = 1;
+		if (from_pub_f) {
+			params_reg.org.from_pub_f = CefC_T_FROM_PUB;
+		}
 	} else {
 		Cef_Int_Regular(params);
 		opt.lifetime 		= CefC_Default_LifetimeSec * 1000;
@@ -569,11 +598,19 @@ int main (
 							}
 							write (1, app_frame.payload, app_frame.payload_len);
 						} else {	//BLOCK
-							fwrite (app_frame.payload, 
+							fwrite (app_frame.payload,
 								sizeof (unsigned char), app_frame.payload_len, stdout);
 							gettimeofday (&t, NULL);
 							now_time = cef_client_covert_timeval_to_us (t);
 							end_time = now_time + 1000000;
+						}
+						/* ラストホップ欠損検知: チャンク番号の飛びを見つけて
+						   repair_table に積む（再要求はメインループ末尾で行う）。
+						   payload は上で既に stdout へ出力済み。整列は行わない。 */
+						if (app_frame.chunk_num_f) {
+							repair_stats.recv_chunks++;
+							loss_detect_on_chunk (&detector, &repair_table,
+								app_frame.chunk_num, &repair_stats);
 						}
 					} else {
 						
@@ -649,6 +686,21 @@ int main (
 			}
 		}
 		
+		/* 欠損リストを見て、欠損チャンクを Regular Interest で再要求する
+		   （Symbolicモードのみ）。どの番号を送るかの判断は repair_sched に委譲し、
+		   ここは返ってきた番号を実際に cefnetd へ送る役だけを担う。 */
+		if (nsg_flag) {
+			repair_sched_run (&repair_table, detector.max_seq_seen,
+				now_time, &repair_stats, &send_list);
+			for (i = 0 ; i < send_list.count ; i++) {
+				params_reg.chunk_num = send_list.chunks[i];
+				opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
+				cef_client_interest_input (fhdl, &opt, &params_reg);
+			}
+			/* 次の Symbolic 送出のため寿命をストリーミング用に戻す */
+			opt.lifetime = sg_lifetime * 1000;
+		}
+
 		/* Sends Interest with Symbolic flag to CEFORE 		*/
 		if (nsg_flag) {
 			if (now_time > nxt_time) {
@@ -670,8 +722,15 @@ IR_RCV:;
 		}
 		opt.lifetime = 0;
 		cef_client_interest_input (fhdl, &opt, &params);
+
+		/* 修復の成果を表示する（media を汚さないよう stderr へ） */
+		fprintf (stderr, "[cefgetstream] ===== Repair Statistics =====\n");
+		fprintf (stderr, "[cefgetstream] Losses detected    = "FMTU64"\n", repair_stats.loss_detected);
+		fprintf (stderr, "[cefgetstream] Repaired (arrived) = "FMTU64"\n", repair_stats.repaired);
+		fprintf (stderr, "[cefgetstream] Regular Interests  = "FMTU64"\n", repair_stats.regular_sent);
+		fprintf (stderr, "[cefgetstream] Gave up            = "FMTU64"\n", repair_stats.gaveup);
 	}
-	
+
 	post_process (stdout);
 	
 	exit (0);
