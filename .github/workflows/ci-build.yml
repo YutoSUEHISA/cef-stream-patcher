@@ -34,20 +34,16 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p build
-          cd build
-          ../configure --enable-debug --enable-cache --enable-csmgr --prefix="$GITHUB_WORKSPACE/install"
+          ./configure --enable-debug --enable-cache --enable-csmgr --prefix="$GITHUB_WORKSPACE/install"
 
       - name: Build
         shell: bash
         run: |
           set -euxo pipefail
-          cd build
           make -j"$(nproc)"
 
       - name: Install
         shell: bash
         run: |
           set -euxo pipefail
-          cd build
           make install
