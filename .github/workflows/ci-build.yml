@@ -3,6 +3,8 @@ name: Build Smoke Test
 on:
   pull_request:
   push:
+    branches:
+      - master
 
 jobs:
   build:
