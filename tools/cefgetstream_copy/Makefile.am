@@ -27,18 +27,28 @@
 # SUCH DAMAGE.
 #
 
-# load sub directry
-SUBDIRS=cefgetstream cefgetstream_copy cefputstream cefgetfile cefputfile cefgetchunk ccninfo
-SUBDIRS+=cefpubfile cefsubfile
+AM_CPPFLAGS = -I$(top_srcdir)/src/include
 
-# check csmgr
-if CSMGR_ENABLE
-SUBDIRS+=csmgr
-endif # CSMGR_ENABLE
+bin_PROGRAMS=cefgetstream_copy
+cefgetstream_copy_LDFLAGS=-L$(top_srcdir)/src/lib/
+cefgetstream_copy_LDADD=-lcefore
+if OPENSSL_STATIC
+cefgetstream_copy_LDADD+=-l:libssl.a -l:libcrypto.a
+else  #OPENSSL_STATIC
+cefgetstream_copy_LDADD+=-lssl -lcrypto
+endif #OPENSSL_STATIC
+cefgetstream_copy_LDADD += -lpthread -ldl
 
-# check conpub
-if CONPUB_ENABLE
-SUBDIRS+=conpub
-endif # CONPUB_ENABLE
+cefgetstream_copy_CFLAGS=$(AM_CPPFLAGS)
+cefgetstream_copy_SOURCES=cefgetstream_copy.c
 
+# check debug build
+if CEFDBG_ENABLE
+cefgetstream_copy_CFLAGS+=-DCefC_Debug
+endif # CEFDBG_ENABLE
 
+DESTDIR=$(CEFORE_DIR_PATH)
+bindir=bin
+
+install-exec-hook:
+	chmod +s $(DESTDIR)$(bindir)/$(bin_PROGRAMS)
