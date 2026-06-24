@@ -54,6 +54,9 @@
 #include "repair_table.h"		/* 欠損リスト（メモ②）の管理       */
 #include "loss_detect.h"		/* 番号の見張り＝欠損検出（メモ①）  */
 #include "repair_sched.h"		/* 修復スケジューラ（場面B/C/D）    */
+#include "reorder_buf.h"		/* 整列バッファ（in-order 出力）    */
+
+#include <fcntl.h>			/* O_NONBLOCK / F_GETFL（NONBLOCK出力用） */
 
 /****************************************************************************************
  Macros
@@ -110,6 +113,16 @@ static void
 print_usage (
 	FILE* ofp
 );
+/* 整列バッファから in-order に出せる分を取り出して stdout へ書き出す。
+   block/nonblock の出力切替は元の Symbolic 受信と同じ挙動を保つ。 */
+static void
+drain_reorder (
+	CefT_Reorder_Buf*	rb,
+	uint32_t			max_seq_seen,
+	uint32_t			give_up_margin,
+	int					blk_mode_val,
+	int*				first_out_f
+);
 
 /****************************************************************************************
  ****************************************************************************************/
@@ -155,6 +168,8 @@ int main (
 	CefT_Loss_Detector		detector;		/* 番号の見張り状態（メモ①）        */
 	CefT_Repair_Stats		repair_stats;	/* 修復の統計                       */
 	CefT_Repair_SendList	send_list;		/* 「今送るべき番号」の一覧         */
+	CefT_Reorder_Buf		reorder;		/* 整列バッファ（in-order 出力）    */
+	int						first_out_f = 0;/* 最初の出力を行ったか(NONBLOCK設定用) */
 	
 	/***** flags 		*****/
 	int pipeline_f 		= 0;
@@ -177,6 +192,7 @@ int main (
 	memset (&params, 0, sizeof (CefT_CcnMsg_MsgBdy));
 	memset (&params_reg, 0, sizeof (CefT_CcnMsg_MsgBdy));
 	memset (&repair_stats, 0, sizeof (repair_stats));
+	memset (&reorder, 0, sizeof (reorder));	/* slots=NULL にしておく（destroy安全化） */
 	repair_table_init (&repair_table);
 	loss_detect_init  (&detector);
 
@@ -457,6 +473,12 @@ int main (
 		if (from_pub_f) {
 			params_reg.org.from_pub_f = CefC_T_FROM_PUB;
 		}
+
+		/* 整列バッファを確保する（Symbolicモードでのみ使う） */
+		if (reorder_init (&reorder) < 0) {
+			printerr("Failed to allocate the reorder buffer.\n");
+			exit (1);
+		}
 	} else {
 		Cef_Int_Regular(params);
 		opt.lifetime 		= CefC_Default_LifetimeSec * 1000;
@@ -584,33 +606,37 @@ int main (
 					if (nsg_flag) {
 						stat_recv_frames++;
 						stat_recv_bytes += app_frame.payload_len;
-						if ( blk_mode_val == 1 ) {	//NONBLOCK
-							int val;
-							if (stat_recv_frames == 1) {
-								if ((val = fcntl(1, F_GETFL, 0)) < 0) {
-									printerr("fcntl F_GETFL error");
-									exit(1);
-								}
-								if (fcntl(1, F_SETFL, val | O_NONBLOCK) < 0) {
-									printerr("fcntl F_SETFL error");
-									exit(1);
-								}
-							}
-							write (1, app_frame.payload, app_frame.payload_len);
-						} else {	//BLOCK
-							fwrite (app_frame.payload,
-								sizeof (unsigned char), app_frame.payload_len, stdout);
-							gettimeofday (&t, NULL);
-							now_time = cef_client_covert_timeval_to_us (t);
-							end_time = now_time + 1000000;
-						}
-						/* ラストホップ欠損検知: チャンク番号の飛びを見つけて
-						   repair_table に積む（再要求はメインループ末尾で行う）。
-						   payload は上で既に stdout へ出力済み。整列は行わない。 */
+
 						if (app_frame.chunk_num_f) {
+							/* ラストホップ欠損検知: 番号の飛びを repair_table に積む
+							   （再要求はメインループ末尾で行う）。 */
 							repair_stats.recv_chunks++;
 							loss_detect_on_chunk (&detector, &repair_table,
 								app_frame.chunk_num, &repair_stats);
+
+							/* 先に窓を空けてから格納する（遠い未来の番号の取りこぼし
+							   防止）。その後 in-order に出せる分を出力する。 */
+							drain_reorder (&reorder, detector.max_seq_seen,
+								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
+							reorder_store (&reorder, app_frame.chunk_num,
+								app_frame.payload, app_frame.payload_len);
+							drain_reorder (&reorder, detector.max_seq_seen,
+								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
+						} else {
+							/* チャンク番号を持たないデータは整列できないので即出力 */
+							if ( blk_mode_val == 1 ) {	//NONBLOCK
+								int val;
+								if (!first_out_f) {
+									first_out_f = 1;
+									if ((val = fcntl(1, F_GETFL, 0)) >= 0) {
+										fcntl(1, F_SETFL, val | O_NONBLOCK);
+									}
+								}
+								write (1, app_frame.payload, app_frame.payload_len);
+							} else {	//BLOCK
+								fwrite (app_frame.payload,
+									sizeof (unsigned char), app_frame.payload_len, stdout);
+							}
 						}
 					} else {
 						
@@ -717,18 +743,25 @@ IR_RCV:;
 	}
 	
 	if (nsg_flag) {
-		if (index > 0) {
-			fwrite (buff, index, 1, stdout);
-		}
+		/* 整列バッファに残った分を吐き出す（末尾に残った欠損は飛ばす＝
+		   give_up_margin=0 で全ての穴を飛ばし、埋まっている分は順に出力）。 */
+		drain_reorder (&reorder, detector.max_seq_seen, 0,
+			blk_mode_val, &first_out_f);
+
 		opt.lifetime = 0;
 		cef_client_interest_input (fhdl, &opt, &params);
 
-		/* 修復の成果を表示する（media を汚さないよう stderr へ） */
+		/* 修復＋整列の成果を表示する（media を汚さないよう stderr へ） */
 		fprintf (stderr, "[cefgetstream] ===== Repair Statistics =====\n");
 		fprintf (stderr, "[cefgetstream] Losses detected    = "FMTU64"\n", repair_stats.loss_detected);
 		fprintf (stderr, "[cefgetstream] Repaired (arrived) = "FMTU64"\n", repair_stats.repaired);
 		fprintf (stderr, "[cefgetstream] Regular Interests  = "FMTU64"\n", repair_stats.regular_sent);
 		fprintf (stderr, "[cefgetstream] Gave up            = "FMTU64"\n", repair_stats.gaveup);
+		fprintf (stderr, "[cefgetstream] Output (in-order)  = "FMTU64"\n", reorder.out_chunks);
+		fprintf (stderr, "[cefgetstream] Output bytes       = "FMTU64"\n", reorder.out_bytes);
+		fprintf (stderr, "[cefgetstream] Skipped (unrecovered) = "FMTU64"\n", reorder.skipped);
+
+		reorder_destroy (&reorder);
 	}
 
 	post_process (stdout);
@@ -817,5 +850,37 @@ sigcatch (
 	if (sig == SIGINT) {
 		printf ("[cefgetstream] Catch the signal\n");
 		app_running_f = 0;
+	}
+}
+
+/*
+ * 整列バッファから in-order に出せるチャンクを取り出し stdout へ書き出す。
+ *   並べ替えの判断は reorder_next（cefore非依存）に任せ、ここは I/O だけ担う。
+ *   block/nonblock の切替は元の Symbolic 受信と同じ挙動を保つ。
+ */
+static void
+drain_reorder (
+	CefT_Reorder_Buf*	rb,
+	uint32_t			max_seq_seen,
+	uint32_t			give_up_margin,
+	int					blk_mode_val,
+	int*				first_out_f
+) {
+	const unsigned char* payload;
+	int len;
+
+	while (reorder_next (rb, max_seq_seen, give_up_margin, &payload, &len)) {
+		if ( blk_mode_val == 1 ) {	//NONBLOCK
+			int val;
+			if (!*first_out_f) {
+				*first_out_f = 1;
+				if ((val = fcntl (1, F_GETFL, 0)) >= 0) {
+					fcntl (1, F_SETFL, val | O_NONBLOCK);
+				}
+			}
+			write (1, payload, len);
+		} else {	//BLOCK
+			fwrite (payload, sizeof (unsigned char), len, stdout);
+		}
 	}
 }
