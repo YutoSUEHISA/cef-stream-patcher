@@ -202,7 +202,13 @@ int main (
 	-----------------------------------------------------------------------------*/
 	uri[0] 			= 0;
 	valid_type[0] 	= 0;
-	
+
+	/* 早期に stdout(fd1) を stderr へ退避する。これ以降の起動表示・ログ・
+	   デバッグ出力はすべて stderr に出て、stdout(=映像)を汚さない。
+	   メインループ直前に dup2(backup_fd,1) で本来の stdout に戻す。 */
+	backup_fd = dup (1);
+	dup2 (2, 1);
+
 	printf ("[cefgetstream] Start\n");
 	
 	/* Inits logging 		*/
@@ -407,9 +413,6 @@ int main (
 	/*---------------------------------------------------------------------------
 		Inits the Cefore APIs
 	-----------------------------------------------------------------------------*/
-	backup_fd = dup (1);
-	dup2(2, 1);
-	
 	cef_frame_init ();
 	res = cef_client_init (port_num, conf_path);
 	if (res < 0) {
@@ -543,6 +546,9 @@ int main (
 	/*---------------------------------------------------------------------------
 		Main loop
 	-----------------------------------------------------------------------------*/
+	/* 起動表示が stdout バッファに残っているので、fd1 が stderr を指している
+	   今のうちに吐き出す。その後 stdout(fd1) を本来の映像出力に戻す。 */
+	fflush (stdout);
 	dup2(backup_fd, 1);
 	while (app_running_f) {
 		if (SIG_ERR == signal (SIGINT, sigcatch)) {
