@@ -544,8 +544,8 @@ int main (
 
 					/* InterestReturn */
 					if ( (uint8_t)app_frame.type == CefC_PT_INTRETURN ) {
-						printf ("[cefgetstream_copy] Incomplete\n");
-						printf ("[cefgetstream_copy] "
+						fprintf (stderr, "[cefgetstream_copy] Incomplete\n");
+						fprintf (stderr, "[cefgetstream_copy] "
 								"Received Interest Return(Type:%02x)\n", app_frame.returncode);
 						app_running_f = 0;
 						goto IR_RCV;
@@ -613,7 +613,7 @@ int main (
 								sizeof (unsigned char), rxwnd->frame_size, stdout);
 							
 							if (rxwnd->seq == UINT32_MAX) {
-								printf ("[cefgetstream_copy] Received the specified number of chunk\n");
+								fprintf (stderr, "[cefgetstream_copy] Received the specified number of chunk\n");
 								app_running_f = 0;
 							}
 							
@@ -653,7 +653,7 @@ int main (
 		if (nsg_flag) {
 			if (now_time > nxt_time) {
 				cef_client_interest_input (fhdl, &opt, &params);
-				printf ("[cefgetstream_copy] Send Long Life Interest\n");
+				fprintf (stderr, "[cefgetstream_copy] Send Long Life Interest\n");
 				nxt_time = now_time + dif_time;
 			}
 		} else {
@@ -672,7 +672,7 @@ IR_RCV:;
 		cef_client_interest_input (fhdl, &opt, &params);
 	}
 	
-	post_process (stdout);
+	post_process (stderr);
 	
 	exit (0);
 }
@@ -756,7 +756,7 @@ sigcatch (
 	int sig
 ) {
 	if (sig == SIGINT) {
-		printf ("[cefgetstream_copy] Catch the signal\n");
+		fprintf (stderr, "[cefgetstream_copy] Catch the signal\n");
 		app_running_f = 0;
 	}
 }
