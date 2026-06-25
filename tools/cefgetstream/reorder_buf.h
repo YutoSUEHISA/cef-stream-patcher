@@ -42,6 +42,9 @@ typedef struct {
 	CefT_Reorder_Slot*	slots;			/* 長さ CefC_Reorder_Window の配列   */
 	uint32_t			next_out_seq;	/* 次に出力すべきチャンク番号        */
 	int					started;		/* 最初のチャンクで基準が定まったか  */
+	uint32_t			chunk_len;		/* 学習したチャンク長(=block_size)。  */
+									/* 永久欠損を飛ばす際、この長さ分の   */
+									/* ゼロを出力してバイト位置を保つ。   */
 
 	/* 統計（main が最後に表示する） */
 	uint64_t			out_chunks;		/* in-order に出力したチャンク数     */
@@ -69,10 +72,12 @@ void reorder_store   (CefT_Reorder_Buf*	rb,
 
 /*
  * in-order に出力できるチャンクを1つ取り出す。while で回して使う。
- *   戻り値 1: out_payload/out_len に出力すべきチャンクを格納した。
+ *   戻り値 1: out_payload/out_len に出力すべきデータを格納した。
  *   戻り値 0: いま出力できるものは無い（欠損待ち、または末尾まで出した）。
  *   max_seq_seen と give_up_margin により「諦め境界より遅れた欠損は飛ばす」
- *   を内部で処理する（飛ばした番号は skipped に計上し、次を探し続ける）。
+ *   を内部で処理する。ただし**飛ばす際は省略せず、学習したチャンク長分の
+ *   ゼロ(out_payload=ゼロ列)を返す**。これで後続のバイト位置がズレず、mp4 等
+ *   のバイトオフセット索引が壊れない（飛ばした数は skipped に計上）。
  *   返したポインタは次に reorder_* を呼ぶまで有効。呼び出し側は即座に書き出す。
  */
 int  reorder_next    (CefT_Reorder_Buf*	rb,

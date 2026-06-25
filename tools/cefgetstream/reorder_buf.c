@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 永久欠損を飛ばすとき、省略せず同じ長さのゼロを出力するための定数バッファ。
+   静的なので最初から全ゼロ。reorder_next がここへのポインタを返す。 */
+static const unsigned char g_reorder_zero[CefC_Reorder_Max_Payload] = {0};
+
 int
 reorder_init (
 	CefT_Reorder_Buf* rb
@@ -65,6 +69,12 @@ reorder_store (
 		len = CefC_Reorder_Max_Payload;
 	}
 
+	/* チャンク長を学習する。最終チャンク以外は block_size 一定なので、
+	   観測した最大長が block_size になる。永久欠損のゼロ埋めに使う。 */
+	if ((uint32_t) len > rb->chunk_len) {
+		rb->chunk_len = (uint32_t) len;
+	}
+
 	s = &rb->slots[seq % CefC_Reorder_Window];
 
 	/* 同じ番号が既に入っていれば二重格納しない。 */
@@ -104,13 +114,16 @@ reorder_next (
 			return (1);
 		}
 
-		/* 先頭が欠損中。諦め境界より遅れていれば永久欠損として飛ばし、
-		   出力を前進させる（飛ばしたら次の番号を続けて調べる）。 */
+		/* 先頭が欠損中。諦め境界より遅れていれば永久欠損とみなす。
+		   省略せず「学習したチャンク長ぶんのゼロ」を出力して前進する。
+		   こうすると後続のバイト位置がズレず、mp4 等の索引が壊れない。 */
 		if (max_seq_seen > rb->next_out_seq &&
 			(max_seq_seen - rb->next_out_seq) > give_up_margin) {
+			*out_payload = g_reorder_zero;
+			*out_len     = (int) rb->chunk_len;	/* 通常は block_size(=1024) */
 			rb->skipped++;
 			rb->next_out_seq++;
-			continue;
+			return (1);
 		}
 
 		/* まだ境界内 → 再要求で届くのを待つ。今は出力しない。 */
