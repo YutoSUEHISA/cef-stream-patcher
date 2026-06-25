@@ -1,0 +1,51 @@
+name: Build Smoke Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            libssl-dev \
+            pkg-config
+
+      - name: Bootstrap autotools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          autoreconf -i
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./configure --enable-debug --enable-cache --enable-csmgr --prefix="$GITHUB_WORKSPACE/install"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make -j"$(nproc)"
+
+      - name: Install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make install
