@@ -27,7 +27,7 @@
  * SUCH DAMAGE.
  */
 /*
- * cefgetstream.c
+ * cefgetstream_copy.c
  */
 
 #define __CEF_GETFILE_SOURECE__
@@ -49,15 +49,6 @@
 #include <cefore/cef_valid.h>
 #include <cefore/cef_log.h>
 
-/* 欠損検知＋再要求の頭脳ロジック（cefore非依存。cefrepair と同じ実装を共有）。
-   Symbolic モード受信時のラストホップ欠損を検出し Regular Interest で再要求する。 */
-#include "repair_table.h"		/* 欠損リスト（メモ②）の管理       */
-#include "loss_detect.h"		/* 番号の見張り＝欠損検出（メモ①）  */
-#include "repair_sched.h"		/* 修復スケジューラ（場面B/C/D）    */
-#include "reorder_buf.h"		/* 整列バッファ（in-order 出力）    */
-
-#include <fcntl.h>			/* O_NONBLOCK / F_GETFL（NONBLOCK出力用） */
-
 /****************************************************************************************
  Macros
  ****************************************************************************************/
@@ -66,7 +57,7 @@
 #define CefC_Def_PipeLine 		8		/* Default Pipeline */
 
 #define USAGE					print_usage(CefFp_Usage)
-#define printerr(...)			fprintf(stderr,"[cefgetstream] ERROR: " __VA_ARGS__)
+#define printerr(...)			fprintf(stderr,"[cefgetstream_copy] ERROR: " __VA_ARGS__)
 
 /****************************************************************************************
  Structures Declaration
@@ -113,16 +104,6 @@ static void
 print_usage (
 	FILE* ofp
 );
-/* 整列バッファから in-order に出せる分を取り出して stdout へ書き出す。
-   block/nonblock の出力切替は元の Symbolic 受信と同じ挙動を保つ。 */
-static void
-drain_reorder (
-	CefT_Reorder_Buf*	rb,
-	uint32_t			max_seq_seen,
-	uint32_t			give_up_margin,
-	int					blk_mode_val,
-	int*				first_out_f
-);
 
 /****************************************************************************************
  ****************************************************************************************/
@@ -159,17 +140,8 @@ int main (
 	Ceft_RxWnd* 	rxwnd_prev;
 	Ceft_RxWnd* 	rxwnd_head;
 	Ceft_RxWnd* 	rxwnd_tail;
-
+	
 	int backup_fd;
-
-	/* 修復用 Regular Interest と、欠損検知＋再要求の状態（Symbolicモードでのみ使う） */
-	CefT_CcnMsg_MsgBdy		params_reg;		/* 再要求する特定チャンク用 Interest */
-	CefT_Repair_Table		repair_table;	/* 欠損リスト本体（メモ②）          */
-	CefT_Loss_Detector		detector;		/* 番号の見張り状態（メモ①）        */
-	CefT_Repair_Stats		repair_stats;	/* 修復の統計                       */
-	CefT_Repair_SendList	send_list;		/* 「今送るべき番号」の一覧         */
-	CefT_Reorder_Buf		reorder;		/* 整列バッファ（in-order 出力）    */
-	int						first_out_f = 0;/* 最初の出力を行ったか(NONBLOCK設定用) */
 	
 	/***** flags 		*****/
 	int pipeline_f 		= 0;
@@ -190,12 +162,7 @@ int main (
 	
 	memset (&opt, 0, sizeof (CefT_CcnMsg_OptHdr));
 	memset (&params, 0, sizeof (CefT_CcnMsg_MsgBdy));
-	memset (&params_reg, 0, sizeof (CefT_CcnMsg_MsgBdy));
-	memset (&repair_stats, 0, sizeof (repair_stats));
-	memset (&reorder, 0, sizeof (reorder));	/* slots=NULL にしておく（destroy安全化） */
-	repair_table_init (&repair_table);
-	loss_detect_init  (&detector);
-
+	
 	
 	/*---------------------------------------------------------------------------
 		Obtains parameters
@@ -209,10 +176,10 @@ int main (
 	backup_fd = dup (1);
 	dup2 (2, 1);
 
-	printf ("[cefgetstream] Start\n");
+	printf ("[cefgetstream_copy] Start\n");
 	
 	/* Inits logging 		*/
-	cef_log_init ("cefgetstream", 1);
+	cef_log_init ("cefgetstream_copy", 1);
 	
 	/* Obtains options 		*/
 	for (i = 1 ; i < argc ; i++) {
@@ -404,10 +371,10 @@ int main (
 	if (pipeline > sv_max_seq + 1) {
 		pipeline = sv_max_seq + 1;
 	}
-	printf ("[cefgetstream] Parsing parameters ... OK\n");
+	printf ("[cefgetstream_copy] Parsing parameters ... OK\n");
 	cef_log_init2 (conf_path, 1 /* for CEFNETD */);
 #ifdef CefC_Debug
-	cef_dbg_init ("cefgetstream", conf_path, 1);
+	cef_dbg_init ("cefgetstream_copy", conf_path, 1);
 #endif // CefC_Debug
 	
 	/*---------------------------------------------------------------------------
@@ -419,16 +386,16 @@ int main (
 		printerr("Failed to init the client package.\n");
 		exit (1);
 	}
-	printf ("[cefgetstream] Init Cefore Client package ... OK\n");
+	printf ("[cefgetstream_copy] Init Cefore Client package ... OK\n");
 	res = cef_frame_conversion_uri_to_name (uri, params.name);
 	if (res < 0) {
 		printerr("Invalid URI is specified.\n");
 		USAGE;
 		exit (1);
 	}
-	printf ("[cefgetstream] Conversion from URI into Name ... OK\n");
+	printf ("[cefgetstream_copy] Conversion from URI into Name ... OK\n");
 	params.name_len = res;
-	printf ("[cefgetstream] Checking the output file ... OK\n");
+	printf ("[cefgetstream_copy] Checking the output file ... OK\n");
 	
 	/*------------------------------------------
 		Set Validation Alglithm
@@ -451,7 +418,7 @@ int main (
 		printerr("cefnetd is not running.\n");
 		exit (1);
 	}
-	printf ("[cefgetstream] Connect to cefnetd ... OK\n");
+	printf ("[cefgetstream_copy] Connect to cefnetd ... OK\n");
 	buff = (unsigned char*) malloc (sizeof (unsigned char) * CefC_AppBuff_Size);
 	memset (&app_frame, 0, sizeof (struct cef_app_frame));
 	
@@ -464,24 +431,6 @@ int main (
 	if (nsg_flag) {
 		Cef_Int_Symbolic(params);
 		opt.lifetime 		= sg_lifetime * 1000;	//0.8.3
-
-		/* 修復用 Regular Interest を準備する。Symbolic と同じ名前を使い、
-		   chunk_num_f=1 で「特定チャンク番号を指定する」と宣言しておく。
-		   実際の番号は欠損が見つかるたびに params_reg.chunk_num を書き換える。 */
-		memcpy (params_reg.name, params.name, params.name_len);
-		params_reg.name_len    = params.name_len;
-		Cef_Int_Regular (params_reg);
-		params_reg.hoplimit    = 32;
-		params_reg.chunk_num_f = 1;
-		if (from_pub_f) {
-			params_reg.org.from_pub_f = CefC_T_FROM_PUB;
-		}
-
-		/* 整列バッファを確保する（Symbolicモードでのみ使う） */
-		if (reorder_init (&reorder) < 0) {
-			printerr("Failed to allocate the reorder buffer.\n");
-			exit (1);
-		}
 	} else {
 		Cef_Int_Regular(params);
 		opt.lifetime 		= CefC_Default_LifetimeSec * 1000;
@@ -508,12 +457,12 @@ int main (
 		Sends first Interest(s)
 	-----------------------------------------------------------------------------*/
 	app_running_f = 1;
-	printf ("[cefgetstream] URI=%s\n", uri);
+	printf ("[cefgetstream_copy] URI=%s\n", uri);
 	if (nsg_flag) {
 		cef_client_interest_input (fhdl, &opt, &params);
-		printf ("[cefgetstream] Start sending Long Life Interests\n");
+		printf ("[cefgetstream_copy] Start sending Long Life Interests\n");
 	} else {
-		printf ("[cefgetstream] Start sending Interests\n");
+		printf ("[cefgetstream_copy] Start sending Interests\n");
 		
 		/* Sends Initerest(s) 		*/
 		for (i = 0 ; i < pipeline ; i++) {
@@ -601,8 +550,8 @@ int main (
 
 					/* InterestReturn */
 					if ( (uint8_t)app_frame.type == CefC_PT_INTRETURN ) {
-						fprintf (stderr, "[cefgetstream] Incomplete\n");
-						fprintf (stderr, "[cefgetstream] "
+						fprintf (stderr, "[cefgetstream_copy] Incomplete\n");
+						fprintf (stderr, "[cefgetstream_copy] "
 								"Received Interest Return(Type:%02x)\n", app_frame.returncode);
 						app_running_f = 0;
 						goto IR_RCV;
@@ -612,37 +561,25 @@ int main (
 					if (nsg_flag) {
 						stat_recv_frames++;
 						stat_recv_bytes += app_frame.payload_len;
-
-						if (app_frame.chunk_num_f) {
-							/* ラストホップ欠損検知: 番号の飛びを repair_table に積む
-							   （再要求はメインループ末尾で行う）。 */
-							repair_stats.recv_chunks++;
-							loss_detect_on_chunk (&detector, &repair_table,
-								app_frame.chunk_num, &repair_stats);
-
-							/* 先に窓を空けてから格納する（遠い未来の番号の取りこぼし
-							   防止）。その後 in-order に出せる分を出力する。 */
-							drain_reorder (&reorder, detector.max_seq_seen,
-								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
-							reorder_store (&reorder, app_frame.chunk_num,
-								app_frame.payload, app_frame.payload_len);
-							drain_reorder (&reorder, detector.max_seq_seen,
-								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
-						} else {
-							/* チャンク番号を持たないデータは整列できないので即出力 */
-							if ( blk_mode_val == 1 ) {	//NONBLOCK
-								int val;
-								if (!first_out_f) {
-									first_out_f = 1;
-									if ((val = fcntl(1, F_GETFL, 0)) >= 0) {
-										fcntl(1, F_SETFL, val | O_NONBLOCK);
-									}
+						if ( blk_mode_val == 1 ) {	//NONBLOCK
+							int val;
+							if (stat_recv_frames == 1) {
+								if ((val = fcntl(1, F_GETFL, 0)) < 0) {
+									printerr("fcntl F_GETFL error");
+									exit(1);
 								}
-								write (1, app_frame.payload, app_frame.payload_len);
-							} else {	//BLOCK
-								fwrite (app_frame.payload,
-									sizeof (unsigned char), app_frame.payload_len, stdout);
+								if (fcntl(1, F_SETFL, val | O_NONBLOCK) < 0) {
+									printerr("fcntl F_SETFL error");
+									exit(1);
+								}
 							}
+							write (1, app_frame.payload, app_frame.payload_len);
+						} else {	//BLOCK
+							fwrite (app_frame.payload, 
+								sizeof (unsigned char), app_frame.payload_len, stdout);
+							gettimeofday (&t, NULL);
+							now_time = cef_client_covert_timeval_to_us (t);
+							end_time = now_time + 1000000;
 						}
 					} else {
 						
@@ -682,7 +619,7 @@ int main (
 								sizeof (unsigned char), rxwnd->frame_size, stdout);
 							
 							if (rxwnd->seq == UINT32_MAX) {
-								fprintf (stderr, "[cefgetstream] Received the specified number of chunk\n");
+								fprintf (stderr, "[cefgetstream_copy] Received the specified number of chunk\n");
 								app_running_f = 0;
 							}
 							
@@ -718,26 +655,11 @@ int main (
 			}
 		}
 		
-		/* 欠損リストを見て、欠損チャンクを Regular Interest で再要求する
-		   （Symbolicモードのみ）。どの番号を送るかの判断は repair_sched に委譲し、
-		   ここは返ってきた番号を実際に cefnetd へ送る役だけを担う。 */
-		if (nsg_flag) {
-			repair_sched_run (&repair_table, detector.max_seq_seen,
-				now_time, &repair_stats, &send_list);
-			for (i = 0 ; i < send_list.count ; i++) {
-				params_reg.chunk_num = send_list.chunks[i];
-				opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
-				cef_client_interest_input (fhdl, &opt, &params_reg);
-			}
-			/* 次の Symbolic 送出のため寿命をストリーミング用に戻す */
-			opt.lifetime = sg_lifetime * 1000;
-		}
-
 		/* Sends Interest with Symbolic flag to CEFORE 		*/
 		if (nsg_flag) {
 			if (now_time > nxt_time) {
 				cef_client_interest_input (fhdl, &opt, &params);
-				fprintf (stderr, "[cefgetstream] Send Long Life Interest\n");
+				fprintf (stderr, "[cefgetstream_copy] Send Long Life Interest\n");
 				nxt_time = now_time + dif_time;
 			}
 		} else {
@@ -749,27 +671,13 @@ IR_RCV:;
 	}
 	
 	if (nsg_flag) {
-		/* 整列バッファに残った分を吐き出す（末尾に残った欠損は飛ばす＝
-		   give_up_margin=0 で全ての穴を飛ばし、埋まっている分は順に出力）。 */
-		drain_reorder (&reorder, detector.max_seq_seen, 0,
-			blk_mode_val, &first_out_f);
-
+		if (index > 0) {
+			fwrite (buff, index, 1, stdout);
+		}
 		opt.lifetime = 0;
 		cef_client_interest_input (fhdl, &opt, &params);
-
-		/* 修復＋整列の成果を表示する（media を汚さないよう stderr へ） */
-		fprintf (stderr, "[cefgetstream] ===== Repair Statistics =====\n");
-		fprintf (stderr, "[cefgetstream] Losses detected    = "FMTU64"\n", repair_stats.loss_detected);
-		fprintf (stderr, "[cefgetstream] Repaired (arrived) = "FMTU64"\n", repair_stats.repaired);
-		fprintf (stderr, "[cefgetstream] Regular Interests  = "FMTU64"\n", repair_stats.regular_sent);
-		fprintf (stderr, "[cefgetstream] Gave up            = "FMTU64"\n", repair_stats.gaveup);
-		fprintf (stderr, "[cefgetstream] Output (in-order)  = "FMTU64"\n", reorder.out_chunks);
-		fprintf (stderr, "[cefgetstream] Output bytes       = "FMTU64"\n", reorder.out_bytes);
-		fprintf (stderr, "[cefgetstream] Skipped (unrecovered) = "FMTU64"\n", reorder.skipped);
-
-		reorder_destroy (&reorder);
 	}
-
+	
 	post_process (stderr);
 	
 	exit (0);
@@ -780,8 +688,8 @@ print_usage (
 	FILE* ofp
 ) {
 	
-	fprintf (ofp, "\nUsage: cefgetstream\n\n");
-	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode]\n\n");
+	fprintf (ofp, "\nUsage: cefgetstream_copy\n\n");
+	fprintf (ofp, "  cefgetstream_copy uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode]\n\n");
 	fprintf (ofp, "  uri              Specify the URI.\n");
 	fprintf (ofp, "  -o               Specify this option if content must be retrieved directly from content owner and not from intermediate cache\n");
 	fprintf (ofp, "  chunks           Specify the number of chunk that you want to obtain\n");
@@ -809,7 +717,7 @@ post_process (
 		if ( !timercmp( &start_t, &end_t, != ) == 0 ) {
 			if ( timercmp( &start_t, &end_t, < ) == 0 ) {
 				// Invalid end time
-				fprintf (ofp, "[cefgetstream] Invalid end time. No time statistics reported.\n");
+				fprintf (ofp, "[cefgetstream_copy] Invalid end time. No time statistics reported.\n");
 				diff_t = 0;
 				invalid_end = 1;
 			} else {
@@ -824,28 +732,28 @@ post_process (
 		diff_t = 0;
 	}
 	usleep (1000000);
-	fprintf (ofp, "[cefgetstream] Unconnect to cefnetd ... ");
+	fprintf (ofp, "[cefgetstream_copy] Unconnect to cefnetd ... ");
 	cef_client_close (fhdl);
 	fprintf (ofp, "OK\n");
 	
-	fprintf (ofp, "[cefgetstream] Terminate\n");
-	fprintf (ofp, "[cefgetstream] Rx Frames = "FMTU64"\n", stat_recv_frames);
-	fprintf (ofp, "[cefgetstream] Rx Bytes  = "FMTU64"\n", stat_recv_bytes);
+	fprintf (ofp, "[cefgetstream_copy] Terminate\n");
+	fprintf (ofp, "[cefgetstream_copy] Rx Frames = "FMTU64"\n", stat_recv_frames);
+	fprintf (ofp, "[cefgetstream_copy] Rx Bytes  = "FMTU64"\n", stat_recv_bytes);
 	if (diff_t > 0) {
 		diff_t_dbl = (double)diff_t / 1000000.0;
-		fprintf (ofp, "[cefgetstream] Duration  = %.3f sec\n", diff_t_dbl + 0.0009);
+		fprintf (ofp, "[cefgetstream_copy] Duration  = %.3f sec\n", diff_t_dbl + 0.0009);
 		recv_bits = stat_recv_bytes * 8;
 		thrpt = (double)(recv_bits) / diff_t_dbl;
-		fprintf (ofp, "[cefgetstream] Throughput = %d bps\n", (int)thrpt);
+		fprintf (ofp, "[cefgetstream_copy] Throughput = %d bps\n", (int)thrpt);
 	} else {
-		fprintf (ofp, "[cefgetstream] Duration  = 0.000 sec\n");
+		fprintf (ofp, "[cefgetstream_copy] Duration  = 0.000 sec\n");
 	}
 	if ((stat_recv_frames > 0) && (invalid_end == 0)) {
 		jitter_ave = stat_jitter_sum / stat_recv_frames;
 
-		fprintf (ofp, "[cefgetstream] Jitter (Ave) = "FMTU64" us\n", jitter_ave);
-		fprintf (ofp, "[cefgetstream] Jitter (Max) = "FMTU64" us\n", stat_jitter_max);
-		fprintf (ofp, "[cefgetstream] Jitter (Var) = "FMTU64" us\n"
+		fprintf (ofp, "[cefgetstream_copy] Jitter (Ave) = "FMTU64" us\n", jitter_ave);
+		fprintf (ofp, "[cefgetstream_copy] Jitter (Max) = "FMTU64" us\n", stat_jitter_max);
+		fprintf (ofp, "[cefgetstream_copy] Jitter (Var) = "FMTU64" us\n"
 			, (stat_jitter_sq_sum / stat_recv_frames) - (jitter_ave * jitter_ave));
 	}
 }
@@ -854,39 +762,7 @@ sigcatch (
 	int sig
 ) {
 	if (sig == SIGINT) {
-		fprintf (stderr, "[cefgetstream] Catch the signal\n");
+		fprintf (stderr, "[cefgetstream_copy] Catch the signal\n");
 		app_running_f = 0;
-	}
-}
-
-/*
- * 整列バッファから in-order に出せるチャンクを取り出し stdout へ書き出す。
- *   並べ替えの判断は reorder_next（cefore非依存）に任せ、ここは I/O だけ担う。
- *   block/nonblock の切替は元の Symbolic 受信と同じ挙動を保つ。
- */
-static void
-drain_reorder (
-	CefT_Reorder_Buf*	rb,
-	uint32_t			max_seq_seen,
-	uint32_t			give_up_margin,
-	int					blk_mode_val,
-	int*				first_out_f
-) {
-	const unsigned char* payload;
-	int len;
-
-	while (reorder_next (rb, max_seq_seen, give_up_margin, &payload, &len)) {
-		if ( blk_mode_val == 1 ) {	//NONBLOCK
-			int val;
-			if (!*first_out_f) {
-				*first_out_f = 1;
-				if ((val = fcntl (1, F_GETFL, 0)) >= 0) {
-					fcntl (1, F_SETFL, val | O_NONBLOCK);
-				}
-			}
-			write (1, payload, len);
-		} else {	//BLOCK
-			fwrite (payload, sizeof (unsigned char), len, stdout);
-		}
 	}
 }

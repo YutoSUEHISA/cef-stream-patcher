@@ -230,6 +230,7 @@ AC_CONFIG_FILES([
   config/Makefile
   tools/Makefile
   tools/cefgetstream/Makefile
+  tools/cefgetstream_copy/Makefile
   tools/cefputstream/Makefile
   tools/cefgetfile/Makefile
   tools/cefputfile/Makefile
