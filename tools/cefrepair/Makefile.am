@@ -29,22 +29,22 @@
 
 AM_CPPFLAGS = -I$(top_srcdir)/src/include
 
-bin_PROGRAMS=cefgetstream
-cefgetstream_LDFLAGS=-L$(top_srcdir)/src/lib/
-cefgetstream_LDADD=-lcefore
+bin_PROGRAMS=cefrepair
+cefrepair_LDFLAGS=-L$(top_srcdir)/src/lib/
+cefrepair_LDADD=-lcefore
 if OPENSSL_STATIC
-cefgetstream_LDADD+=-l:libssl.a -l:libcrypto.a
+cefrepair_LDADD+=-l:libssl.a -l:libcrypto.a
 else  #OPENSSL_STATIC
-cefgetstream_LDADD+=-lssl -lcrypto
+cefrepair_LDADD+=-lssl -lcrypto
 endif #OPENSSL_STATIC
-cefgetstream_LDADD += -lpthread -ldl
+cefrepair_LDADD += -lpthread -ldl
 
-cefgetstream_CFLAGS=$(AM_CPPFLAGS)
-cefgetstream_SOURCES=cefgetstream.c repair_table.c loss_detect.c repair_sched.c reorder_buf.c
+cefrepair_CFLAGS=$(AM_CPPFLAGS)
+cefrepair_SOURCES=cefrepair.c repair_table.c loss_detect.c repair_sched.c
 
 # check debug build
 if CEFDBG_ENABLE
-cefgetstream_CFLAGS+=-DCefC_Debug
+cefrepair_CFLAGS+=-DCefC_Debug
 endif # CEFDBG_ENABLE
 
 DESTDIR=$(CEFORE_DIR_PATH)
