@@ -53,9 +53,20 @@ reorder_store (
 		rb->next_out_seq = seq;
 	}
 
-	/* 既に出力済み/スキップ済みの古い番号（再要求の重複到着など）は捨てる。 */
+	/* 起点より小さい番号が届いた場合。
+	   まだ1バイトも出力していなければ、最先頭の到着順入れ替わり
+	   （例: chunk1 が chunk0 より先に届いて起点=1 になった）なので、
+	   捨てずに起点を下げ直して受け入れる（rebase）。出力開始後は
+	   手遅れ（先頭側はもう stdout に書いた）なので、従来どおり
+	   出力/スキップ済みの重複として捨てる。Start_Grace を超える古さは
+	   途中参加時の古い重複とみなし、これも捨てる（窓の衝突防止）。 */
 	if (seq < rb->next_out_seq) {
-		return;
+		if (rb->out_chunks == 0 && rb->skipped == 0 &&
+			(rb->next_out_seq - seq) <= CefC_Reorder_Start_Grace) {
+			rb->next_out_seq = seq;
+		} else {
+			return;
+		}
 	}
 
 	/* 窓からあふれる遠い未来の番号は今は入れられない。呼び出し側が先に
@@ -100,6 +111,16 @@ reorder_next (
 		return (0);
 	}
 
+	/* 出力開始前の猶予: 最先頭は到着順が入れ替わることがあり、起点より
+	   小さい番号（本物の先頭）がまだ届くかもしれない。max_seq_seen が
+	   起点+Start_Grace を超えるまで出力を保留する（超えたら入れ替わりは
+	   もう起こらないとみなして通常運転へ）。give_up_margin==0 は終端
+	   フラッシュの合図なので保留しない。 */
+	if (rb->out_chunks == 0 && rb->skipped == 0 && give_up_margin > 0 &&
+		max_seq_seen < rb->next_out_seq + CefC_Reorder_Start_Grace) {
+		return (0);
+	}
+
 	for (;;) {
 		CefT_Reorder_Slot* s = &rb->slots[rb->next_out_seq % CefC_Reorder_Window];
 
@@ -123,6 +144,9 @@ reorder_next (
 			*out_len     = (int) rb->chunk_len;	/* 通常は block_size(=1024) */
 			rb->skipped++;
 			rb->next_out_seq++;
+			rb->out_bytes += (uint64_t) rb->chunk_len;	/* ゼロ埋めも出力サイズに
+														   数える（ファイル実サイズ
+														   と一致させるため） */
 			return (1);
 		}
 

@@ -22,6 +22,17 @@
    大きくすること（窓 > 境界。さもないと飛ばす前にスロットが衝突する）。 */
 #define CefC_Reorder_Window			128
 
+/* 出力開始前の「起点確定の猶予」（チャンク数）。
+   ストリーム最先頭で chunk0 と chunk1 の到着順が入れ替わると、先着の方が
+   起点(next_out_seq)になり、本物の先頭が「古い番号」として捨てられてしまう
+   （実測: t1rep で 4/50 ラン、先頭1〜2チャンク欠けの mp4 が発生）。
+   そこで、まだ1バイトも出力していない間は
+     ・起点より小さい番号が届いたら起点を下げ直して受け入れる（rebase）
+     ・max_seq_seen が起点+この猶予を超えるまで出力を保留する
+   到着順の入れ替わりは1〜2チャンク規模なので 16 で十分。遅延コストは
+   -r5(610ch/s) で約26ms。諦め境界(80)・窓(128)より小さくすること。 */
+#define CefC_Reorder_Start_Grace	16
+
 /* 1チャンクの最大ペイロード長（cefore の CefC_Max_Length=65535 に合わせる）。 */
 #define CefC_Reorder_Max_Payload	65535
 
@@ -48,7 +59,8 @@ typedef struct {
 
 	/* 統計（main が最後に表示する） */
 	uint64_t			out_chunks;		/* in-order に出力したチャンク数     */
-	uint64_t			out_bytes;		/* 出力したバイト数                  */
+	uint64_t			out_bytes;		/* 出力したバイト数（ゼロ埋め分も含む */
+										/* ＝出力ファイルの実サイズと一致）   */
 	uint64_t			skipped;		/* 永久欠損として飛ばした数          */
 } CefT_Reorder_Buf;
 
@@ -61,7 +73,11 @@ void reorder_destroy (CefT_Reorder_Buf* rb);
 /*
  * 受信した1チャンクを整列窓に格納する。
  *   ・最初の格納で next_out_seq を seq に合わせる（途中参加の起点）。
- *   ・既に出力/スキップ済み(seq < next_out_seq)なら捨てる。
+ *   ・まだ何も出力していない間に起点より小さい番号が届いたら、捨てずに
+ *     起点を下げ直して受け入れる（rebase。最先頭の到着順入れ替わり対策。
+ *     下げ幅が CefC_Reorder_Start_Grace を超える古さなら途中参加の重複と
+ *     みなして従来どおり捨てる）。
+ *   ・出力開始後は、既に出力/スキップ済み(seq < next_out_seq)なら捨てる。
  *   ・窓からあふれる(seq >= next_out_seq + 窓)場合は捨てる。呼び出し側が
  *     先に reorder_next で窓を空ければ（飛ばし前進）通常は収まる。
  */
@@ -78,6 +94,10 @@ void reorder_store   (CefT_Reorder_Buf*	rb,
  *   を内部で処理する。ただし**飛ばす際は省略せず、学習したチャンク長分の
  *   ゼロ(out_payload=ゼロ列)を返す**。これで後続のバイト位置がズレず、mp4 等
  *   のバイトオフセット索引が壊れない（飛ばした数は skipped に計上）。
+ *   まだ1バイトも出力していない間は、max_seq_seen が起点+Start_Grace を
+ *   超えるまで出力を保留する（最先頭の到着順入れ替わりを待つ猶予）。
+ *   例外として give_up_margin==0 は終端フラッシュ（残りを全部吐き出す）の
+ *   合図なので、猶予中でも保留せず出力する。
  *   返したポインタは次に reorder_* を呼ぶまで有効。呼び出し側は即座に書き出す。
  */
 int  reorder_next    (CefT_Reorder_Buf*	rb,
