@@ -23,6 +23,8 @@ typedef struct {
 	int			used;			/* この行が使用中か（1=使用中, 0=空き）         */
 	uint32_t	chunk_num;		/* 欠損しているチャンク番号                    */
 	uint64_t	last_req_time;	/* 最後に Regular Interest を送った時刻(us)     */
+	uint64_t	first_detect_time;/* 欠損として最初に検出した時刻(us)。          */
+							/* 修復遅延 = 修復到着時刻 - この値。          */
 	int			retry_count;	/* これまでに注文した回数                      */
 } CefT_Repair_Entry;
 
@@ -51,8 +53,10 @@ typedef struct {
 void repair_table_init   (CefT_Repair_Table* tbl);
 
 /* 1件追加する。すでに同じ番号があれば二重登録しない。
+   detect_time には「欠損と気づいた時刻(us)」を渡す（トレース用）。
    戻り値: 0=追加できた（または既に登録済み）, -1=満杯で追加できなかった。 */
-int  repair_table_add    (CefT_Repair_Table* tbl, uint32_t chunk_num);
+int  repair_table_add    (CefT_Repair_Table* tbl, uint32_t chunk_num,
+                          uint64_t detect_time);
 
 /* 指定番号の行を削除する（修復成功時に呼ぶ）。 */
 void repair_table_remove (CefT_Repair_Table* tbl, uint32_t chunk_num);

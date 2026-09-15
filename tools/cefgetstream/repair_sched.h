@@ -26,9 +26,12 @@
 /* 1つの欠損チャンクを最大何回まで注文し直すか（無限ループ防止）。 */
 #define CefC_Repair_Max_Retry		3
 
-/* 「これより古い番号はもう諦める」境界の余裕（チャンク数）。
+/* 「これより古い番号はもう諦める」境界の既定値（チャンク数）。
    最新番号からこの数だけ過去までは取り寄せを試みる。cefnetd.conf の
-   SYMBOLIC_BACKBUFFER（既定100）より少し小さい値にしておくのが安全。 */
+   SYMBOLIC_BACKBUFFER（既定100）より少し小さい値にしておくのが安全。
+   実行時に cefgetstream の --giveup-margin で上書きできる（実験で振るため）。
+   時間に直すと「境界チャンク数 ÷ チャンク到着レート」。送出 -r5・1024B なら
+   610チャンク/秒なので 80 ≒ 131ms が修復に使える時間予算になる。 */
 #define CefC_Repair_GiveUp_Margin	80
 
 /*
@@ -43,13 +46,16 @@ typedef struct {
 /*
  * 欠損リストを1巡して、送るべき番号を out に積んで返す。
  *   tbl（last_req_time / retry_count / used）と stats を更新する。
- *   max_seq_seen は諦め判定（場面D）に使う。
+ *   max_seq_seen と give_up_margin は諦め判定（場面D）に使う。
+ *   give_up_margin は実験で振るため引数化してある（既定値は
+ *   CefC_Repair_GiveUp_Margin）。
  *   cefore には一切依存しない。
  */
 void repair_sched_run (
 	CefT_Repair_Table*		tbl,
 	uint32_t				max_seq_seen,
 	uint64_t				now_time,
+	uint32_t				give_up_margin,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out);
 

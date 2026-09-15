@@ -12,15 +12,20 @@
  *        ・諦め境界(give_up_margin)より遅れた番号は永久欠損として飛ばす
  *      I/O（stdout への書き出し）は行わない。出力すべきチャンクを返すだけ。
  *      cefore には依存しない純粋ロジックなので単体テストできる。
+ *
+ *      あわせて、トレース記録用のメタ情報（到着時刻・検出時刻・再要求回数・
+ *      種別）をチャンクに随伴させて運ぶ。実時間性の評価では「いつ届いて
+ *      いつ出したか」が主指標になるため。
  */
 #ifndef __CEF_REORDER_BUF_H__
 #define __CEF_REORDER_BUF_H__
 
 #include <stdint.h>
 
-/* 整列窓のスロット数。repair の諦め境界(CefC_Repair_GiveUp_Margin=80)より
-   大きくすること（窓 > 境界。さもないと飛ばす前にスロットが衝突する）。 */
-#define CefC_Reorder_Window			128
+/* 整列窓のスロット数。repair の諦め境界より大きくすること（窓 > 境界。
+   さもないと飛ばす前にスロットが衝突する）。実験で諦め境界を 160 まで
+   振るため 128 → 256 に拡張した（メモリは 256 × 64KB ≒ 16.8MB）。 */
+#define CefC_Reorder_Window			256
 
 /* 出力開始前の「起点確定の猶予」（チャンク数）。
    ストリーム最先頭で chunk0 と chunk1 の到着順が入れ替わると、先着の方が
@@ -30,11 +35,27 @@
      ・起点より小さい番号が届いたら起点を下げ直して受け入れる（rebase）
      ・max_seq_seen が起点+この猶予を超えるまで出力を保留する
    到着順の入れ替わりは1〜2チャンク規模なので 16 で十分。遅延コストは
-   -r5(610ch/s) で約26ms。諦め境界(80)・窓(128)より小さくすること。 */
+   -r5(610ch/s) で約26ms。諦め境界・窓より小さくすること。 */
 #define CefC_Reorder_Start_Grace	16
 
 /* 1チャンクの最大ペイロード長（cefore の CefC_Max_Length=65535 に合わせる）。 */
 #define CefC_Reorder_Max_Payload	65535
+
+/* チャンクの種別（トレースの kind 列）。 */
+#define CefC_Chunk_Kind_Normal		0	/* 普通に届いた                     */
+#define CefC_Chunk_Kind_Repaired	1	/* 再要求で取り戻した               */
+#define CefC_Chunk_Kind_ZeroFill	2	/* 諦めてゼロ埋めした（届かなかった）*/
+
+/*
+ * トレース記録用に、チャンク1個へ随伴させるメタ情報。
+ *   整列バッファは中身を解釈せず、格納時に受け取って出力時に返すだけ。
+ */
+typedef struct {
+	uint64_t	arrive_time;	/* 受信した時刻(us)。ゼロ埋めなら 0        */
+	uint64_t	detect_time;	/* 欠損として検出した時刻(us)。無ければ 0  */
+	int			n_req;			/* 送った Regular Interest の回数          */
+	int			kind;			/* CefC_Chunk_Kind_*                       */
+} CefT_Chunk_Meta;
 
 /*
  * 整列窓の1スロット。チャンク番号 seq のペイロードを1つ保持する。
@@ -43,6 +64,7 @@ typedef struct {
 	int				used;		/* このスロットが埋まっているか(1=使用中)     */
 	uint32_t		seq;		/* 格納しているチャンク番号                  */
 	int				len;		/* ペイロード長                              */
+	CefT_Chunk_Meta	meta;		/* トレース用メタ情報                        */
 	unsigned char	payload[CefC_Reorder_Max_Payload];
 } CefT_Reorder_Slot;
 
@@ -80,11 +102,13 @@ void reorder_destroy (CefT_Reorder_Buf* rb);
  *   ・出力開始後は、既に出力/スキップ済み(seq < next_out_seq)なら捨てる。
  *   ・窓からあふれる(seq >= next_out_seq + 窓)場合は捨てる。呼び出し側が
  *     先に reorder_next で窓を空ければ（飛ばし前進）通常は収まる。
+ *   meta は NULL 可（トレースが不要な場合）。NULL なら種別 Normal 扱い。
  */
 void reorder_store   (CefT_Reorder_Buf*	rb,
                       uint32_t			seq,
                       const unsigned char* payload,
-                      int				len);
+                      int				len,
+                      const CefT_Chunk_Meta* meta);
 
 /*
  * in-order に出力できるチャンクを1つ取り出す。while で回して使う。
@@ -98,12 +122,16 @@ void reorder_store   (CefT_Reorder_Buf*	rb,
  *   超えるまで出力を保留する（最先頭の到着順入れ替わりを待つ猶予）。
  *   例外として give_up_margin==0 は終端フラッシュ（残りを全部吐き出す）の
  *   合図なので、猶予中でも保留せず出力する。
+ *   out_seq / out_meta は NULL 可。トレースを取るなら渡すこと（出力した
+ *   チャンク番号と、その到着時刻・種別が分かる）。
  *   返したポインタは次に reorder_* を呼ぶまで有効。呼び出し側は即座に書き出す。
  */
 int  reorder_next    (CefT_Reorder_Buf*	rb,
                       uint32_t			max_seq_seen,
                       uint32_t			give_up_margin,
                       const unsigned char** out_payload,
-                      int*				out_len);
+                      int*				out_len,
+                      uint32_t*			out_seq,
+                      CefT_Chunk_Meta*	out_meta);
 
 #endif // __CEF_REORDER_BUF_H__

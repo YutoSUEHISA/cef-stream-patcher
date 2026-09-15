@@ -24,8 +24,17 @@ loss_detect_on_chunk (
 	CefT_Loss_Detector*	det,
 	CefT_Repair_Table*	tbl,
 	uint32_t			seq,
-	CefT_Repair_Stats*	stats
+	uint64_t			now_time,
+	CefT_Repair_Stats*	stats,
+	CefT_Loss_Result*	res
 ) {
+	/* 呼び出し側が res を見るので、まず「普通に届いた」状態に初期化しておく */
+	if (res != NULL) {
+		res->repaired_f  = 0;
+		res->detect_time = 0;
+		res->n_req       = 0;
+	}
+
 	/* --- A-1: いちばん最初に受け取ったチャンクの場合 --- */
 	/* ストリームの途中から要求を始めたので、これより前の番号は「欠損」では
 	   ない。ここを起点にするだけ。 */
@@ -36,10 +45,20 @@ loss_detect_on_chunk (
 	}
 
 	/* --- A-2: 欠損リストに載っていた番号が今届いた場合 → 修復成功 --- */
-	if (repair_table_find (tbl, seq) >= 0) {
-		repair_table_remove (tbl, seq);
-		stats->repaired++;
-		fprintf (stderr, "[cefgetstream] Repaired chunk=%u\n", seq);
+	{
+		int idx = repair_table_find (tbl, seq);
+		if (idx >= 0) {
+			/* 行を消す前に、トレースに要る情報を写し取っておく
+			   （消したあとでは detect_time も retry_count も読めない）。 */
+			if (res != NULL) {
+				res->repaired_f  = 1;
+				res->detect_time = tbl->entries[idx].first_detect_time;
+				res->n_req       = tbl->entries[idx].retry_count;
+			}
+			repair_table_remove (tbl, seq);
+			stats->repaired++;
+			fprintf (stderr, "[cefgetstream] Repaired chunk=%u\n", seq);
+		}
 	}
 
 	/* --- A-3: 番号が飛んでいた場合（欠損の検出） --- */
@@ -47,7 +66,7 @@ loss_detect_on_chunk (
 	if (seq > det->max_seq_seen + 1) {
 		uint32_t k;
 		for (k = det->max_seq_seen + 1 ; k < seq ; k++) {
-			if (repair_table_add (tbl, k) < 0) {
+			if (repair_table_add (tbl, k, now_time) < 0) {
 				printerr ("repair table is full (chunk=%u dropped)\n", k);
 			}
 			stats->loss_detected++;

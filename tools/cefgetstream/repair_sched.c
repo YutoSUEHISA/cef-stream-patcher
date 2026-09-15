@@ -24,6 +24,7 @@ repair_sched_run (
 	CefT_Repair_Table*		tbl,
 	uint32_t				max_seq_seen,
 	uint64_t				now_time,
+	uint32_t				give_up_margin,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out
 ) {
@@ -40,9 +41,9 @@ repair_sched_run (
 		}
 
 		/* 【場面D】 古すぎる番号はもう間に合わないので諦める。
-		   最新番号から CefC_Repair_GiveUp_Margin より過去なら削除。 */
-		if (max_seq_seen > CefC_Repair_GiveUp_Margin &&
-			e->chunk_num < max_seq_seen - CefC_Repair_GiveUp_Margin) {
+		   最新番号から give_up_margin より過去なら削除。 */
+		if (max_seq_seen > give_up_margin &&
+			e->chunk_num < max_seq_seen - give_up_margin) {
 			fprintf (stderr, "[cefgetstream] Give up chunk=%u (too old)\n", e->chunk_num);
 			e->used = 0;
 			stats->gaveup++;

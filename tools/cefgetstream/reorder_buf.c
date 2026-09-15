@@ -42,7 +42,8 @@ reorder_store (
 	CefT_Reorder_Buf*		rb,
 	uint32_t				seq,
 	const unsigned char*	payload,
-	int						len
+	int						len,
+	const CefT_Chunk_Meta*	meta
 ) {
 	CefT_Reorder_Slot* s;
 
@@ -96,6 +97,12 @@ reorder_store (
 	s->used = 1;
 	s->seq  = seq;
 	s->len  = len;
+	if (meta != NULL) {
+		s->meta = *meta;
+	} else {
+		memset (&s->meta, 0, sizeof (s->meta));
+		s->meta.kind = CefC_Chunk_Kind_Normal;
+	}
 	memcpy (s->payload, payload, len);
 }
 
@@ -105,7 +112,9 @@ reorder_next (
 	uint32_t				max_seq_seen,
 	uint32_t				give_up_margin,
 	const unsigned char**	out_payload,
-	int*					out_len
+	int*					out_len,
+	uint32_t*				out_seq,
+	CefT_Chunk_Meta*		out_meta
 ) {
 	if (!rb->started) {
 		return (0);
@@ -128,6 +137,8 @@ reorder_next (
 		if (s->used && s->seq == rb->next_out_seq) {
 			*out_payload = s->payload;
 			*out_len     = s->len;
+			if (out_seq  != NULL) { *out_seq  = rb->next_out_seq; }
+			if (out_meta != NULL) { *out_meta = s->meta; }
 			s->used      = 0;
 			rb->next_out_seq++;
 			rb->out_chunks++;
@@ -142,6 +153,11 @@ reorder_next (
 			(max_seq_seen - rb->next_out_seq) > give_up_margin) {
 			*out_payload = g_reorder_zero;
 			*out_len     = (int) rb->chunk_len;	/* 通常は block_size(=1024) */
+			if (out_seq != NULL) { *out_seq = rb->next_out_seq; }
+			if (out_meta != NULL) {
+				memset (out_meta, 0, sizeof (*out_meta));
+				out_meta->kind = CefC_Chunk_Kind_ZeroFill;
+			}
 			rb->skipped++;
 			rb->next_out_seq++;
 			rb->out_bytes += (uint64_t) rb->chunk_len;	/* ゼロ埋めも出力サイズに

@@ -18,7 +18,8 @@ repair_table_init (
 int
 repair_table_add (
 	CefT_Repair_Table*	tbl,
-	uint32_t			chunk_num
+	uint32_t			chunk_num,
+	uint64_t			detect_time
 ) {
 	int i;
 
@@ -33,6 +34,7 @@ repair_table_add (
 			tbl->entries[i].used          = 1;
 			tbl->entries[i].chunk_num     = chunk_num;
 			tbl->entries[i].last_req_time = 0;
+			tbl->entries[i].first_detect_time = detect_time;
 			tbl->entries[i].retry_count   = 0;	/* まだ注文していない印 */
 			return (0);
 		}

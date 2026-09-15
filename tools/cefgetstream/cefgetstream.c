@@ -97,6 +97,16 @@ static struct timeval start_t;
 static struct timeval end_t;
 CefT_Client_Handle fhdl;
 
+/* --- トレース計装（実時間性の評価用）--------------------------------------
+   チャンク1個につき1行、「いつ届いて・いつ欠損を検出して・いつ出力したか」を
+   CSV で書き出す。ここから 修復遅延／整列滞留時間／出力ギャップ(=フリーズ)／
+   間に合い率 を後処理で計算する。--trace <path> を付けたときだけ有効。
+   映像は stdout 専用なので、トレースは必ずファイルへ書く（stderr も統計表示
+   で使うため混ぜない）。 */
+static FILE*	g_trace_fp		= NULL;	/* トレース出力先（NULL=無効） */
+static uint64_t	g_trace_t0		= 0;	/* 相対時刻の起点(us)          */
+static uint64_t	g_trace_lines	= 0;	/* 書き出した行数              */
+
 /****************************************************************************************
  Static Function Declaration
  ****************************************************************************************/
@@ -121,7 +131,16 @@ drain_reorder (
 	uint32_t			max_seq_seen,
 	uint32_t			give_up_margin,
 	int					blk_mode_val,
-	int*				first_out_f
+	int*				first_out_f,
+	uint64_t			now_time
+);
+/* トレースに1行書く（--trace 指定時のみ）。時刻は起点からの相対 us。 */
+static void
+trace_write (
+	uint32_t				seq,
+	const CefT_Chunk_Meta*	meta,
+	uint64_t				t_out,
+	int						len
 );
 
 /****************************************************************************************
@@ -170,7 +189,14 @@ int main (
 	CefT_Repair_SendList	send_list;		/* 「今送るべき番号」の一覧         */
 	CefT_Reorder_Buf		reorder;		/* 整列バッファ（in-order 出力）    */
 	int						first_out_f = 0;/* 最初の出力を行ったか(NONBLOCK設定用) */
-	
+	CefT_Loss_Result		loss_res;		/* 1チャンク処理の結果（トレース用）*/
+	CefT_Chunk_Meta			chunk_meta;		/* 整列バッファへ随伴させるメタ情報 */
+
+	/* 諦め境界。既定は CefC_Repair_GiveUp_Margin(80)。実験で振るため
+	   --giveup-margin で実行時に変更できる（再ビルド不要）。 */
+	uint32_t	giveup_margin		= CefC_Repair_GiveUp_Margin;
+	char		trace_path[PATH_MAX] = {0};
+
 	/***** flags 		*****/
 	int pipeline_f 		= 0;
 	int max_seq_f 		= 0;
@@ -183,6 +209,8 @@ int main (
 	//0.8.3
 	int blk_mode_f		= 0;
 	int blk_mode_val	= 0;	//BLOCK
+	int trace_f			= 0;
+	int giveup_f		= 0;
 	
 	/***** state variavles 	*****/
 	uint32_t 	sv_max_seq 		= UINT_MAX - 1;
@@ -365,6 +393,52 @@ int main (
 			strcpy (valid_type, work_arg);
 			valid_f++;
 			i++;
+		} else if (strcmp (work_arg, "--trace") == 0) {
+			/* チャンク単位のトレースを CSV で書き出す（実時間性の評価用） */
+			if (trace_f) {
+				printerr("[--trace] is duplicated.\n");
+				USAGE;
+				return (-1);
+			}
+			if (i + 1 == argc) {
+				printerr("[--trace] has no parameter.\n");
+				USAGE;
+				return (-1);
+			}
+			work_arg = argv[i + 1];
+			if (strlen (work_arg) >= PATH_MAX) {
+				printerr("[--trace] path is too long.\n");
+				USAGE;
+				return (-1);
+			}
+			strcpy (trace_path, work_arg);
+			trace_f++;
+			i++;
+		} else if (strcmp (work_arg, "--giveup-margin") == 0) {
+			/* 諦め境界（チャンク数）を実行時に指定する。実験で振るため。 */
+			if (giveup_f) {
+				printerr("[--giveup-margin] is duplicated.\n");
+				USAGE;
+				return (-1);
+			}
+			if (i + 1 == argc) {
+				printerr("[--giveup-margin] has no parameter.\n");
+				USAGE;
+				return (-1);
+			}
+			work_arg = argv[i + 1];
+			res = atoi (work_arg);
+			/* 窓より小さく、起点確定の猶予より大きい必要がある
+			   （窓 > 境界 > Start_Grace）。 */
+			if (res <= CefC_Reorder_Start_Grace || res >= CefC_Reorder_Window) {
+				printerr("[--giveup-margin] must be > %d and < %d.\n",
+					CefC_Reorder_Start_Grace, CefC_Reorder_Window);
+				USAGE;
+				return (-1);
+			}
+			giveup_margin = (uint32_t) res;
+			giveup_f++;
+			i++;
 		} else if (strcmp (work_arg, "-h") == 0) {
 			USAGE;
 			exit (1);
@@ -481,6 +555,35 @@ int main (
 		if (reorder_init (&reorder) < 0) {
 			printerr("Failed to allocate the reorder buffer.\n");
 			exit (1);
+		}
+
+		/* トレース出力を開く（--trace 指定時のみ）。先頭に条件を注記して
+		   おくと、後処理でどの設定のランか分かる。 */
+		if (trace_f) {
+			g_trace_fp = fopen (trace_path, "w");
+			if (g_trace_fp == NULL) {
+				printerr("Failed to open the trace file: %s\n", trace_path);
+				exit (1);
+			}
+			gettimeofday (&t, NULL);
+			g_trace_t0 = cef_client_covert_timeval_to_us (t);
+			fprintf (g_trace_fp,
+				"# cefgetstream trace\n"
+				"# uri=%s\n"
+				"# start_epoch_us=" FMTU64 "\n"
+				"# giveup_margin=%u\n"
+				"# reorder_window=%d\n"
+				"# start_grace=%d\n"
+				"# repair_timeout_us=%d\n"
+				"# repair_max_retry=%d\n"
+				"# sg_lifetime_sec=%d\n"
+				"# times are microseconds relative to start_epoch_us\n"
+				"seq,t_arrive_us,t_detect_us,t_out_us,n_req,kind,len\n",
+				uri, g_trace_t0, giveup_margin,
+				CefC_Reorder_Window, CefC_Reorder_Start_Grace,
+				CefC_Repair_Timeout_us, CefC_Repair_Max_Retry, sg_lifetime);
+			fprintf (stderr, "[cefgetstream] Trace  = %s (giveup_margin=%u)\n",
+				trace_path, giveup_margin);
 		}
 	} else {
 		Cef_Int_Regular(params);
@@ -615,19 +718,31 @@ int main (
 
 						if (app_frame.chunk_num_f) {
 							/* ラストホップ欠損検知: 番号の飛びを repair_table に積む
-							   （再要求はメインループ末尾で行う）。 */
+							   （再要求はメインループ末尾で行う）。
+							   loss_res には「このチャンクは再要求で取り戻したのか」
+							   「いつ欠損に気づいたか」「何回注文したか」が返る。
+							   欠損リストの行は消える前にしか読めないのでここで取る。 */
 							repair_stats.recv_chunks++;
 							loss_detect_on_chunk (&detector, &repair_table,
-								app_frame.chunk_num, &repair_stats);
+								app_frame.chunk_num, now_time, &repair_stats, &loss_res);
+
+							/* トレース用メタ情報を組み立てて、チャンクに随伴させる。
+							   出力は整列バッファを通ってから行われるため、到着時刻は
+							   ここで捕まえておかないと失われる。 */
+							chunk_meta.arrive_time = now_time;
+							chunk_meta.detect_time = loss_res.detect_time;
+							chunk_meta.n_req       = loss_res.n_req;
+							chunk_meta.kind        = loss_res.repaired_f
+								? CefC_Chunk_Kind_Repaired : CefC_Chunk_Kind_Normal;
 
 							/* 先に窓を空けてから格納する（遠い未来の番号の取りこぼし
 							   防止）。その後 in-order に出せる分を出力する。 */
 							drain_reorder (&reorder, detector.max_seq_seen,
-								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
+								giveup_margin, blk_mode_val, &first_out_f, now_time);
 							reorder_store (&reorder, app_frame.chunk_num,
-								app_frame.payload, app_frame.payload_len);
+								app_frame.payload, app_frame.payload_len, &chunk_meta);
 							drain_reorder (&reorder, detector.max_seq_seen,
-								CefC_Repair_GiveUp_Margin, blk_mode_val, &first_out_f);
+								giveup_margin, blk_mode_val, &first_out_f, now_time);
 						} else {
 							/* チャンク番号を持たないデータは整列できないので即出力 */
 							if ( blk_mode_val == 1 ) {	//NONBLOCK
@@ -723,7 +838,7 @@ int main (
 		   ここは返ってきた番号を実際に cefnetd へ送る役だけを担う。 */
 		if (nsg_flag) {
 			repair_sched_run (&repair_table, detector.max_seq_seen,
-				now_time, &repair_stats, &send_list);
+				now_time, giveup_margin, &repair_stats, &send_list);
 			for (i = 0 ; i < send_list.count ; i++) {
 				params_reg.chunk_num = send_list.chunks[i];
 				opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
@@ -751,8 +866,10 @@ IR_RCV:;
 	if (nsg_flag) {
 		/* 整列バッファに残った分を吐き出す（末尾に残った欠損は飛ばす＝
 		   give_up_margin=0 で全ての穴を飛ばし、埋まっている分は順に出力）。 */
+		gettimeofday (&t, NULL);
+		now_time = cef_client_covert_timeval_to_us (t);
 		drain_reorder (&reorder, detector.max_seq_seen, 0,
-			blk_mode_val, &first_out_f);
+			blk_mode_val, &first_out_f, now_time);
 
 		opt.lifetime = 0;
 		cef_client_interest_input (fhdl, &opt, &params);
@@ -766,6 +883,13 @@ IR_RCV:;
 		fprintf (stderr, "[cefgetstream] Output (in-order)  = "FMTU64"\n", reorder.out_chunks);
 		fprintf (stderr, "[cefgetstream] Output bytes       = "FMTU64"\n", reorder.out_bytes);
 		fprintf (stderr, "[cefgetstream] Skipped (unrecovered) = "FMTU64"\n", reorder.skipped);
+		fprintf (stderr, "[cefgetstream] Give-up margin      = %u chunks\n", giveup_margin);
+
+		if (g_trace_fp != NULL) {
+			fprintf (stderr, "[cefgetstream] Trace lines        = "FMTU64"\n", g_trace_lines);
+			fclose (g_trace_fp);
+			g_trace_fp = NULL;
+		}
 
 		reorder_destroy (&reorder);
 	}
@@ -781,7 +905,7 @@ print_usage (
 ) {
 	
 	fprintf (ofp, "\nUsage: cefgetstream\n\n");
-	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode]\n\n");
+	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode] [--trace path] [--giveup-margin N]\n\n");
 	fprintf (ofp, "  uri              Specify the URI.\n");
 	fprintf (ofp, "  -o               Specify this option if content must be retrieved directly from content owner and not from intermediate cache\n");
 	fprintf (ofp, "  chunks           Specify the number of chunk that you want to obtain\n");
@@ -790,7 +914,13 @@ print_usage (
 	fprintf (ofp, "  config_file_dir  Configure file directory\n");
 	fprintf (ofp, "  port_num         Port Number\n");
 	fprintf (ofp, "  Lifetime         Send Long Life Intereset Lifetime\n");
-	fprintf (ofp, "  block_mode       0:BLOCK    1:NONBLOCK\n\n");
+	fprintf (ofp, "  block_mode       0:BLOCK    1:NONBLOCK\n");
+	fprintf (ofp, "  --trace path     Write a per-chunk CSV trace to 'path' (Symbolic mode only).\n");
+	fprintf (ofp, "                   Columns: seq,t_arrive_us,t_detect_us,t_out_us,n_req,kind,len\n");
+	fprintf (ofp, "                   Times are microseconds relative to the run start.\n");
+	fprintf (ofp, "  --giveup-margin N  Chunks to wait before giving up on a lost chunk\n");
+	fprintf (ofp, "                   (default %d, must be > %d and < %d).\n\n",
+		CefC_Repair_GiveUp_Margin, CefC_Reorder_Start_Grace, CefC_Reorder_Window);
 }
 
 static void
@@ -870,12 +1000,16 @@ drain_reorder (
 	uint32_t			max_seq_seen,
 	uint32_t			give_up_margin,
 	int					blk_mode_val,
-	int*				first_out_f
+	int*				first_out_f,
+	uint64_t			now_time
 ) {
 	const unsigned char* payload;
 	int len;
+	uint32_t seq;
+	CefT_Chunk_Meta meta;
 
-	while (reorder_next (rb, max_seq_seen, give_up_margin, &payload, &len)) {
+	while (reorder_next (rb, max_seq_seen, give_up_margin,
+			&payload, &len, &seq, &meta)) {
 		if ( blk_mode_val == 1 ) {	//NONBLOCK
 			int val;
 			if (!*first_out_f) {
@@ -888,5 +1022,49 @@ drain_reorder (
 		} else {	//BLOCK
 			fwrite (payload, sizeof (unsigned char), len, stdout);
 		}
+		/* 出力した瞬間を記録する。ここが「再生に間に合ったか」の基準時刻。 */
+		trace_write (seq, &meta, now_time, len);
 	}
+}
+
+/*
+ * トレースに1行書く。--trace が指定されていなければ何もしない。
+ *   時刻は g_trace_t0 からの相対 us。値が無い欄は空にする
+ *   （ゼロ埋めチャンクには到着時刻が無い、など）。
+ */
+static void
+trace_write (
+	uint32_t				seq,
+	const CefT_Chunk_Meta*	meta,
+	uint64_t				t_out,
+	int						len
+) {
+	const char* kind_str;
+
+	if (g_trace_fp == NULL) {
+		return;
+	}
+
+	switch (meta->kind) {
+	case CefC_Chunk_Kind_Repaired:	kind_str = "repaired";	break;
+	case CefC_Chunk_Kind_ZeroFill:	kind_str = "zerofill";	break;
+	default:						kind_str = "normal";	break;
+	}
+
+	fprintf (g_trace_fp, "%u,", seq);
+
+	if (meta->arrive_time) {
+		fprintf (g_trace_fp, FMTU64, meta->arrive_time - g_trace_t0);
+	}
+	fputc (',', g_trace_fp);
+
+	if (meta->detect_time) {
+		fprintf (g_trace_fp, FMTU64, meta->detect_time - g_trace_t0);
+	}
+	fputc (',', g_trace_fp);
+
+	fprintf (g_trace_fp, FMTU64",%d,%s,%d\n",
+		t_out - g_trace_t0, meta->n_req, kind_str, len);
+
+	g_trace_lines++;
 }
