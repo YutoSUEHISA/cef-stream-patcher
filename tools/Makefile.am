@@ -28,7 +28,7 @@
 #
 
 # load sub directry
-SUBDIRS=cefgetstream cefputstream cefgetfile cefputfile cefgetchunk ccninfo
+SUBDIRS=cefgetstream cefgetstream_copy cefputstream cefgetfile cefputfile cefgetchunk ccninfo
 SUBDIRS+=cefpubfile cefsubfile
 
 # check csmgr
