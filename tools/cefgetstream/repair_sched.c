@@ -25,6 +25,8 @@ repair_sched_run (
 	uint32_t				max_seq_seen,
 	uint64_t				now_time,
 	uint32_t				give_up_margin,
+	uint32_t				head_limit,
+	uint32_t				head_margin,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out
 ) {
@@ -34,16 +36,23 @@ repair_sched_run (
 
 	for (i = 0 ; i < CefC_Repair_Table_Size ; i++) {
 		CefT_Repair_Entry* e = &tbl->entries[i];
+		int			in_head;
+		uint32_t	margin;
 
 		/* 空き行は飛ばす */
 		if (!e->used) {
 			continue;
 		}
 
+		/* 先頭保護: 先頭区間（索引などの構造情報）の欠損は、諦め境界を
+		   head_margin まで延ばし、再要求の回数上限も外して待ち続ける。 */
+		in_head = (head_limit > 0 && e->chunk_num < head_limit);
+		margin  = in_head ? head_margin : give_up_margin;
+
 		/* 【場面D】 古すぎる番号はもう間に合わないので諦める。
-		   最新番号から give_up_margin より過去なら削除。 */
-		if (max_seq_seen > give_up_margin &&
-			e->chunk_num < max_seq_seen - give_up_margin) {
+		   最新番号から margin より過去なら削除。 */
+		if (max_seq_seen > margin &&
+			e->chunk_num < max_seq_seen - margin) {
 			fprintf (stderr, "[cefgetstream] Give up chunk=%u (too old)\n", e->chunk_num);
 			e->used = 0;
 			stats->gaveup++;
@@ -62,7 +71,7 @@ repair_sched_run (
 
 		/* 【場面C】 注文済みだが、待ち時間を過ぎても返事が来ない行 */
 		if (now_time - e->last_req_time > CefC_Repair_Timeout_us) {
-			if (e->retry_count >= CefC_Repair_Max_Retry) {
+			if (e->retry_count >= CefC_Repair_Max_Retry && !in_head) {
 				/* 上限まで注文したのに届かない → 諦めて削除 */
 				fprintf (stderr, "[cefgetstream] Give up chunk=%u (max retry)\n", e->chunk_num);
 				e->used = 0;

@@ -197,6 +197,14 @@ int main (
 	uint32_t	giveup_margin		= CefC_Repair_GiveUp_Margin;
 	char		trace_path[PATH_MAX] = {0};
 
+	/* 先頭保護のチャンク数（0 で無効）。--head-protect で変更できる。
+	   ストリーム先頭のこの範囲（mp4 なら ftyp と moov＝索引）は、諦め境界を
+	   窓の上限まで延ばし、再要求の回数上限も外して修復を待つ。
+	   head_limit は「最初に受信した番号 + head_protect」で、最初のチャンクを
+	   受けた時点で確定する。 */
+	uint32_t	head_protect		= CefC_Reorder_Head_Protect;
+	uint32_t	head_limit			= 0;
+
 	/***** flags 		*****/
 	int pipeline_f 		= 0;
 	int max_seq_f 		= 0;
@@ -211,6 +219,7 @@ int main (
 	int blk_mode_val	= 0;	//BLOCK
 	int trace_f			= 0;
 	int giveup_f		= 0;
+	int head_f			= 0;
 	
 	/***** state variavles 	*****/
 	uint32_t 	sv_max_seq 		= UINT_MAX - 1;
@@ -439,6 +448,28 @@ int main (
 			giveup_margin = (uint32_t) res;
 			giveup_f++;
 			i++;
+		} else if (strcmp (work_arg, "--head-protect") == 0) {
+			/* 先頭保護のチャンク数を指定する（0 で無効＝比較用）。 */
+			if (head_f) {
+				printerr("[--head-protect] is duplicated.\n");
+				USAGE;
+				return (-1);
+			}
+			if (i + 1 == argc) {
+				printerr("[--head-protect] has no parameter.\n");
+				USAGE;
+				return (-1);
+			}
+			work_arg = argv[i + 1];
+			res = atoi (work_arg);
+			if (res < 0) {
+				printerr("[--head-protect] must be >= 0.\n");
+				USAGE;
+				return (-1);
+			}
+			head_protect = (uint32_t) res;
+			head_f++;
+			i++;
 		} else if (strcmp (work_arg, "-h") == 0) {
 			USAGE;
 			exit (1);
@@ -572,6 +603,8 @@ int main (
 				"# uri=%s\n"
 				"# start_epoch_us=" FMTU64 "\n"
 				"# giveup_margin=%u\n"
+				"# head_protect=%u\n"
+				"# head_margin=%d\n"
 				"# reorder_window=%d\n"
 				"# start_grace=%d\n"
 				"# repair_timeout_us=%d\n"
@@ -580,6 +613,7 @@ int main (
 				"# times are microseconds relative to start_epoch_us\n"
 				"seq,t_arrive_us,t_detect_us,t_out_us,n_req,kind,len\n",
 				uri, g_trace_t0, giveup_margin,
+				head_protect, CefC_Reorder_Head_Margin,
 				CefC_Reorder_Window, CefC_Reorder_Start_Grace,
 				CefC_Repair_Timeout_us, CefC_Repair_Max_Retry, sg_lifetime);
 			fprintf (stderr, "[cefgetstream] Trace  = %s (giveup_margin=%u)\n",
@@ -726,6 +760,16 @@ int main (
 							loss_detect_on_chunk (&detector, &repair_table,
 								app_frame.chunk_num, now_time, &repair_stats, &loss_res);
 
+							/* 先頭保護の範囲を、最初のチャンクを受けた時点で確定する。
+							   最先頭の到着順入れ替わり（chunk1 が先着）でも、
+							   本物の先頭は範囲の内側に入る。 */
+							if (head_protect > 0 && head_limit == 0 &&
+								detector.first_received_f) {
+								head_limit = detector.max_seq_seen + head_protect;
+								reorder.head_limit  = head_limit;
+								reorder.head_margin = CefC_Reorder_Head_Margin;
+							}
+
 							/* トレース用メタ情報を組み立てて、チャンクに随伴させる。
 							   出力は整列バッファを通ってから行われるため、到着時刻は
 							   ここで捕まえておかないと失われる。 */
@@ -838,7 +882,8 @@ int main (
 		   ここは返ってきた番号を実際に cefnetd へ送る役だけを担う。 */
 		if (nsg_flag) {
 			repair_sched_run (&repair_table, detector.max_seq_seen,
-				now_time, giveup_margin, &repair_stats, &send_list);
+				now_time, giveup_margin, head_limit, CefC_Reorder_Head_Margin,
+				&repair_stats, &send_list);
 			for (i = 0 ; i < send_list.count ; i++) {
 				params_reg.chunk_num = send_list.chunks[i];
 				opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
@@ -884,6 +929,9 @@ IR_RCV:;
 		fprintf (stderr, "[cefgetstream] Output bytes       = "FMTU64"\n", reorder.out_bytes);
 		fprintf (stderr, "[cefgetstream] Skipped (unrecovered) = "FMTU64"\n", reorder.skipped);
 		fprintf (stderr, "[cefgetstream] Give-up margin      = %u chunks\n", giveup_margin);
+		fprintf (stderr, "[cefgetstream] Head protect       = %u chunks (margin %d, limit %u)\n",
+			head_protect, CefC_Reorder_Head_Margin, head_limit);
+		fprintf (stderr, "[cefgetstream] Head zero-filled   = "FMTU64"\n", reorder.head_skipped);
 
 		if (g_trace_fp != NULL) {
 			fprintf (stderr, "[cefgetstream] Trace lines        = "FMTU64"\n", g_trace_lines);
@@ -905,7 +953,7 @@ print_usage (
 ) {
 	
 	fprintf (ofp, "\nUsage: cefgetstream\n\n");
-	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode] [--trace path] [--giveup-margin N]\n\n");
+	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode] [--trace path] [--giveup-margin N] [--head-protect N]\n\n");
 	fprintf (ofp, "  uri              Specify the URI.\n");
 	fprintf (ofp, "  -o               Specify this option if content must be retrieved directly from content owner and not from intermediate cache\n");
 	fprintf (ofp, "  chunks           Specify the number of chunk that you want to obtain\n");
@@ -919,8 +967,12 @@ print_usage (
 	fprintf (ofp, "                   Columns: seq,t_arrive_us,t_detect_us,t_out_us,n_req,kind,len\n");
 	fprintf (ofp, "                   Times are microseconds relative to the run start.\n");
 	fprintf (ofp, "  --giveup-margin N  Chunks to wait before giving up on a lost chunk\n");
-	fprintf (ofp, "                   (default %d, must be > %d and < %d).\n\n",
+	fprintf (ofp, "                   (default %d, must be > %d and < %d).\n",
 		CefC_Repair_GiveUp_Margin, CefC_Reorder_Start_Grace, CefC_Reorder_Window);
+	fprintf (ofp, "  --head-protect N Protect the first N chunks (e.g. mp4 ftyp/moov index):\n");
+	fprintf (ofp, "                   wait up to %d chunks and never stop re-requesting them.\n",
+		CefC_Reorder_Head_Margin);
+	fprintf (ofp, "                   (default %d, 0 disables).\n\n", CefC_Reorder_Head_Protect);
 }
 
 static void

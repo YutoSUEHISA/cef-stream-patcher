@@ -148,9 +148,25 @@ reorder_next (
 
 		/* 先頭が欠損中。諦め境界より遅れていれば永久欠損とみなす。
 		   省略せず「学習したチャンク長ぶんのゼロ」を出力して前進する。
-		   こうすると後続のバイト位置がズレず、mp4 等の索引が壊れない。 */
+		   こうすると後続のバイト位置がズレず、mp4 等の索引が指す位置は保たれる
+		   （ただし索引そのものに穴が落ちるのは防げない。そのため先頭は保護する）。
+
+		   先頭保護: 出力先頭が head_limit 未満（索引などの構造情報が集中する
+		   区間）の間は、諦め境界を head_margin（窓の上限）まで延ばして待つ。
+		   give_up_margin==0 は終端フラッシュの合図なので、保護より優先して
+		   全て吐き出す。 */
+		{
+		uint32_t margin = give_up_margin;
+		int in_head = (give_up_margin > 0 && rb->head_limit > 0 &&
+					   rb->next_out_seq < rb->head_limit);
+		if (in_head) {
+			margin = rb->head_margin;
+		}
 		if (max_seq_seen > rb->next_out_seq &&
-			(max_seq_seen - rb->next_out_seq) > give_up_margin) {
+			(max_seq_seen - rb->next_out_seq) > margin) {
+			if (in_head) {
+				rb->head_skipped++;		/* 保護しても間に合わなかった */
+			}
 			*out_payload = g_reorder_zero;
 			*out_len     = (int) rb->chunk_len;	/* 通常は block_size(=1024) */
 			if (out_seq != NULL) { *out_seq = rb->next_out_seq; }
@@ -164,6 +180,7 @@ reorder_next (
 														   数える（ファイル実サイズ
 														   と一致させるため） */
 			return (1);
+		}
 		}
 
 		/* まだ境界内 → 再要求で届くのを待つ。今は出力しない。 */

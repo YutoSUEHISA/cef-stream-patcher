@@ -38,6 +38,23 @@
    -r5(610ch/s) で約26ms。諦め境界・窓より小さくすること。 */
 #define CefC_Reorder_Start_Grace	16
 
+/* 先頭保護の既定チャンク数（--head-protect で変更、0 で無効）。
+   mp4 の先頭には ftyp と moov（索引）が集中している。moov 内のサンプル位置表
+   (stco) の 1024B が 1 ブロックでもゼロ埋めされると、その表が指す約 8.6 秒ぶん
+   の映像が丸ごと再生不能になる（実測: test3・損失1%・遅延200ms で
+   チャンク32〜34の穴が 44.7〜70.4 秒の 26 秒フリーズを起こした）。
+   ゼロ埋めは映像データの位置は守れるが、位置を記した索引そのものは守れない。
+   そこで先頭のこの範囲は、諦め境界を窓の上限（Window-1）まで延ばし、
+   再要求の回数上限も外して、できる限り修復を待つ。代償は起動が遅れることだけ。
+   実験素材の moov は 79〜213 チャンクなので 256 で全て覆える。 */
+#define CefC_Reorder_Head_Protect	256
+
+/* 先頭保護中の諦め境界。窓からあふれない最大値（Window-1）。
+   これ以上待つと、待っている間に届いた後続チャンクが窓に入り切らず
+   黙って捨てられ、かえって新しい欠損を作ってしまう。
+   率1.00（485 チャンク/秒）で約 525 ms。 */
+#define CefC_Reorder_Head_Margin	(CefC_Reorder_Window - 1)
+
 /* 1チャンクの最大ペイロード長（cefore の CefC_Max_Length=65535 に合わせる）。 */
 #define CefC_Reorder_Max_Payload	65535
 
@@ -84,6 +101,13 @@ typedef struct {
 	uint64_t			out_bytes;		/* 出力したバイト数（ゼロ埋め分も含む */
 										/* ＝出力ファイルの実サイズと一致）   */
 	uint64_t			skipped;		/* 永久欠損として飛ばした数          */
+
+	/* 先頭保護（0 なら無効）。出力先頭の番号が head_limit 未満の間は、
+	   諦め境界として give_up_margin の代わりに head_margin を使う。
+	   main が最初のチャンクを受けた時点で設定する。reorder_init で 0 になる。 */
+	uint32_t			head_limit;		/* この番号未満は先頭扱い            */
+	uint32_t			head_margin;	/* 先頭での諦め境界（窓-1 が上限）   */
+	uint64_t			head_skipped;	/* 先頭保護中にそれでも飛ばした数    */
 } CefT_Reorder_Buf;
 
 /* 初期化（slots を確保）。成功 0 / 失敗 -1。 */

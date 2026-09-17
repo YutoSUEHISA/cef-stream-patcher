@@ -49,6 +49,9 @@ typedef struct {
  *   max_seq_seen と give_up_margin は諦め判定（場面D）に使う。
  *   give_up_margin は実験で振るため引数化してある（既定値は
  *   CefC_Repair_GiveUp_Margin）。
+ *   先頭保護: chunk_num < head_limit の行は、諦め境界に head_margin を使い、
+ *   再要求の回数上限（CefC_Repair_Max_Retry）でも諦めない。
+ *   head_limit==0 なら保護は無効（従来どおり）。
  *   cefore には一切依存しない。
  */
 void repair_sched_run (
@@ -56,6 +59,8 @@ void repair_sched_run (
 	uint32_t				max_seq_seen,
 	uint64_t				now_time,
 	uint32_t				give_up_margin,
+	uint32_t				head_limit,
+	uint32_t				head_margin,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out);
 
