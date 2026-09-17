@@ -19,8 +19,14 @@
 #include <stdint.h>
 #include "repair_table.h"
 
-/* Regular Interest を送ってから「返事が来ない」と判断するまでの待ち時間(us)。
-   100000us = 100ms。 */
+/* Regular Interest を送ってから「返事が来ない」と判断するまでの待ち時間(us)
+   の既定値。100000us = 100ms。実行時に cefgetstream の --repair-timeout で
+   上書きできる。
+   この値が修復の往復時間(RTT)より短いと、最初の要求の返事が届く前に必ず
+   再要求が飛ぶ（片道遅延200msの実測では修復RTT約210msに対し1欠損あたり
+   毎回3回要求が出た）。すると「予算切れで失敗した」のか「待ち時間の設定が
+   短すぎて失敗した」のかが分離できず、再要求回数も実際の再送を表さなく
+   なるので、遅延を振る実験では最大RTTを上回る値を与えること。 */
 #define CefC_Repair_Timeout_us		100000
 
 /* 1つの欠損チャンクを最大何回まで注文し直すか（無限ループ防止）。 */
@@ -52,6 +58,8 @@ typedef struct {
  *   先頭保護: chunk_num < head_limit の行は、諦め境界に head_margin を使い、
  *   再要求の回数上限（CefC_Repair_Max_Retry）でも諦めない。
  *   head_limit==0 なら保護は無効（従来どおり）。
+ *   repair_timeout_us は再要求までの待ち時間（既定 CefC_Repair_Timeout_us）。
+ *   実験で振るため引数化してある。
  *   cefore には一切依存しない。
  */
 void repair_sched_run (
@@ -61,6 +69,7 @@ void repair_sched_run (
 	uint32_t				give_up_margin,
 	uint32_t				head_limit,
 	uint32_t				head_margin,
+	uint32_t				repair_timeout_us,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out);
 

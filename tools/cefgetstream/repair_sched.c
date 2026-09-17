@@ -27,6 +27,7 @@ repair_sched_run (
 	uint32_t				give_up_margin,
 	uint32_t				head_limit,
 	uint32_t				head_margin,
+	uint32_t				repair_timeout_us,
 	CefT_Repair_Stats*		stats,
 	CefT_Repair_SendList*	out
 ) {
@@ -70,7 +71,7 @@ repair_sched_run (
 		}
 
 		/* 【場面C】 注文済みだが、待ち時間を過ぎても返事が来ない行 */
-		if (now_time - e->last_req_time > CefC_Repair_Timeout_us) {
+		if (now_time - e->last_req_time > repair_timeout_us) {
 			if (e->retry_count >= CefC_Repair_Max_Retry && !in_head) {
 				/* 上限まで注文したのに届かない → 諦めて削除 */
 				fprintf (stderr, "[cefgetstream] Give up chunk=%u (max retry)\n", e->chunk_num);

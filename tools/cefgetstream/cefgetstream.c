@@ -197,6 +197,12 @@ int main (
 	uint32_t	giveup_margin		= CefC_Repair_GiveUp_Margin;
 	char		trace_path[PATH_MAX] = {0};
 
+	/* 欠損を再要求してから「返事が来ない」と判断するまでの待ち時間(us)。
+	   既定は CefC_Repair_Timeout_us(100ms)。--repair-timeout でミリ秒指定できる。
+	   修復の往復時間より短いと無駄な再要求が出るので、上流に遅延を入れる
+	   実験では最大RTTを上回る値を与えること。 */
+	uint32_t	repair_timeout_us	= CefC_Repair_Timeout_us;
+
 	/* 先頭保護のチャンク数（0 で無効）。--head-protect で変更できる。
 	   ストリーム先頭のこの範囲（mp4 なら ftyp と moov＝索引）は、諦め境界を
 	   窓の上限まで延ばし、再要求の回数上限も外して修復を待つ。
@@ -220,6 +226,7 @@ int main (
 	int trace_f			= 0;
 	int giveup_f		= 0;
 	int head_f			= 0;
+	int timeout_f		= 0;
 	
 	/***** state variavles 	*****/
 	uint32_t 	sv_max_seq 		= UINT_MAX - 1;
@@ -470,6 +477,30 @@ int main (
 			head_protect = (uint32_t) res;
 			head_f++;
 			i++;
+		} else if (strcmp (work_arg, "--repair-timeout") == 0) {
+			/* 再要求までの待ち時間をミリ秒で指定する（実験で振るため）。 */
+			if (timeout_f) {
+				printerr("[--repair-timeout] is duplicated.\n");
+				USAGE;
+				return (-1);
+			}
+			if (i + 1 == argc) {
+				printerr("[--repair-timeout] has no parameter.\n");
+				USAGE;
+				return (-1);
+			}
+			work_arg = argv[i + 1];
+			res = atoi (work_arg);
+			/* 0 以下では毎周回で再要求が出てしまう。上限は諦め境界の時間予算を
+			   大きく超えても意味がないので 10 秒で足りる。 */
+			if (res <= 0 || res > 10000) {
+				printerr("[--repair-timeout] must be > 0 and <= 10000 (msec).\n");
+				USAGE;
+				return (-1);
+			}
+			repair_timeout_us = (uint32_t) res * 1000;
+			timeout_f++;
+			i++;
 		} else if (strcmp (work_arg, "-h") == 0) {
 			USAGE;
 			exit (1);
@@ -607,7 +638,7 @@ int main (
 				"# head_margin=%d\n"
 				"# reorder_window=%d\n"
 				"# start_grace=%d\n"
-				"# repair_timeout_us=%d\n"
+				"# repair_timeout_us=%u\n"
 				"# repair_max_retry=%d\n"
 				"# sg_lifetime_sec=%d\n"
 				"# times are microseconds relative to start_epoch_us\n"
@@ -615,7 +646,7 @@ int main (
 				uri, g_trace_t0, giveup_margin,
 				head_protect, CefC_Reorder_Head_Margin,
 				CefC_Reorder_Window, CefC_Reorder_Start_Grace,
-				CefC_Repair_Timeout_us, CefC_Repair_Max_Retry, sg_lifetime);
+				repair_timeout_us, CefC_Repair_Max_Retry, sg_lifetime);
 			fprintf (stderr, "[cefgetstream] Trace  = %s (giveup_margin=%u)\n",
 				trace_path, giveup_margin);
 		}
@@ -883,7 +914,7 @@ int main (
 		if (nsg_flag) {
 			repair_sched_run (&repair_table, detector.max_seq_seen,
 				now_time, giveup_margin, head_limit, CefC_Reorder_Head_Margin,
-				&repair_stats, &send_list);
+				repair_timeout_us, &repair_stats, &send_list);
 			for (i = 0 ; i < send_list.count ; i++) {
 				params_reg.chunk_num = send_list.chunks[i];
 				opt.lifetime = CefC_Default_LifetimeSec * 1000;	/* 修復は通常寿命 */
@@ -932,6 +963,7 @@ IR_RCV:;
 		fprintf (stderr, "[cefgetstream] Head protect       = %u chunks (margin %d, limit %u)\n",
 			head_protect, CefC_Reorder_Head_Margin, head_limit);
 		fprintf (stderr, "[cefgetstream] Head zero-filled   = "FMTU64"\n", reorder.head_skipped);
+		fprintf (stderr, "[cefgetstream] Repair timeout     = %u us\n", repair_timeout_us);
 
 		if (g_trace_fp != NULL) {
 			fprintf (stderr, "[cefgetstream] Trace lines        = "FMTU64"\n", g_trace_lines);
@@ -953,7 +985,7 @@ print_usage (
 ) {
 	
 	fprintf (ofp, "\nUsage: cefgetstream\n\n");
-	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode] [--trace path] [--giveup-margin N] [--head-protect N]\n\n");
+	fprintf (ofp, "  cefgetstream uri [-o] [-m chunks] [-s pipeline] [-v valid_algo] [-d config_file_dir] [-p port_num] [-z Lifetime] [-l block_mode] [--trace path] [--giveup-margin N] [--head-protect N] [--repair-timeout MS]\n\n");
 	fprintf (ofp, "  uri              Specify the URI.\n");
 	fprintf (ofp, "  -o               Specify this option if content must be retrieved directly from content owner and not from intermediate cache\n");
 	fprintf (ofp, "  chunks           Specify the number of chunk that you want to obtain\n");
@@ -972,7 +1004,11 @@ print_usage (
 	fprintf (ofp, "  --head-protect N Protect the first N chunks (e.g. mp4 ftyp/moov index):\n");
 	fprintf (ofp, "                   wait up to %d chunks and never stop re-requesting them.\n",
 		CefC_Reorder_Head_Margin);
-	fprintf (ofp, "                   (default %d, 0 disables).\n\n", CefC_Reorder_Head_Protect);
+	fprintf (ofp, "                   (default %d, 0 disables).\n", CefC_Reorder_Head_Protect);
+	fprintf (ofp, "  --repair-timeout MS  Milliseconds to wait before re-requesting a lost chunk\n");
+	fprintf (ofp, "                   (default %d, must be > 0 and <= 10000).\n", CefC_Repair_Timeout_us / 1000);
+	fprintf (ofp, "                   Set it above the repair round-trip time, or every\n");
+	fprintf (ofp, "                   request is retried before the first reply can arrive.\n\n");
 }
 
 static void
